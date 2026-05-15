@@ -149,6 +149,13 @@ def test_ss_tag():
     assert out["tag"] == "SS_test"
 
 
+def test_ss_no_fragment_fallback_tag():
+    uri = "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNz@10.0.0.1:8388"
+    # No fragment → tag should be "ss-10.0.0.1"
+    out = parse_ss(uri)
+    assert out["tag"] == "ss-10.0.0.1"
+
+
 # ── Trojan tests ─────────────────────────────────────────────────────────────
 
 def test_trojan_basic():
@@ -179,6 +186,14 @@ def test_trojan_ws_transport():
     assert out["transport"]["headers"]["Host"] == "cdn.example.com"
 
 
+def test_trojan_tls_always_present():
+    uri = "trojan://pass@1.2.3.4:443#minimal"
+    out = parse_trojan(uri)
+    assert "tls" in out
+    assert out["tls"]["enabled"] is True
+    assert "insecure" not in out["tls"]
+
+
 # ── Hysteria2 tests ──────────────────────────────────────────────────────────
 
 def test_hysteria2_basic():
@@ -205,6 +220,14 @@ def test_hysteria2_hy2_alias():
     uri = "hy2://pass@host:443?insecure=1#hy2-alias"
     out = parse_hysteria2(uri)
     assert out["type"] == "hysteria2"
+
+
+def test_hysteria2_tls_always_present():
+    uri = "hysteria2://pass@1.2.3.4:443#minimal"
+    out = parse_hysteria2(uri)
+    assert "tls" in out
+    assert out["tls"]["enabled"] is True
+    assert "insecure" not in out["tls"]
 
 
 # ── extract_country tests ────────────────────────────────────────────────────
