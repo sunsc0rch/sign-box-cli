@@ -100,3 +100,195 @@ def test_remove_active_stops_service(tmp_library, monkeypatch, capsys):
         mock_sa.assert_called_once_with("stop")
     out = capsys.readouterr().out
     assert any(word in out.lower() for word in ["warning", "warn", "active", "removing"])
+
+
+# ── list / show ──────────────────────────────────────────────────────────────
+
+def test_list_all(tmp_library, monkeypatch, capsys):
+    _populated_lib(tmp_library, monkeypatch)
+    proxyctl.cmd_list(_make_args(protocol=None, country=None))
+    out = capsys.readouterr().out
+    assert "vless" in out
+    assert "ss" in out or "shadowsocks" in out
+
+
+def test_list_filter_protocol(tmp_library, monkeypatch, capsys):
+    _populated_lib(tmp_library, monkeypatch)
+    proxyctl.cmd_list(_make_args(protocol="vless", country=None))
+    out = capsys.readouterr().out
+    assert "vless" in out
+    assert "trojan" not in out
+
+
+def test_list_filter_country(tmp_library, monkeypatch, capsys):
+    _populated_lib(tmp_library, monkeypatch)
+    proxyctl.cmd_list(_make_args(protocol=None, country="RU"))
+    out = capsys.readouterr().out
+    assert "RU" in out
+
+
+def test_list_empty(tmp_library, monkeypatch, capsys):
+    monkeypatch.setattr(proxyctl, "PROXIES_FILE", tmp_library)
+    proxyctl.cmd_list(_make_args(protocol=None, country=None))
+    out = capsys.readouterr().out
+    assert "No proxies" in out
+
+
+def test_show_existing(tmp_library, monkeypatch, capsys):
+    _populated_lib(tmp_library, monkeypatch)
+    proxyctl.cmd_show(_make_args(id=1))
+    out = capsys.readouterr().out
+    assert "vless" in out
+    assert "fastcon-tgg.harknmav.fun" in out
+
+
+def test_show_nonexistent_exits(tmp_library, monkeypatch):
+    monkeypatch.setattr(proxyctl, "PROXIES_FILE", tmp_library)
+    with pytest.raises(SystemExit):
+        proxyctl.cmd_show(_make_args(id=999))
+
+
+# ── service / use / status ────────────────────────────────────────────────────
+
+def test_service_action_calls_systemctl():
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0)
+        proxyctl.service_action("start")
+        mock_run.assert_called_once_with(
+            ["systemctl", "start", "sing-box"], capture_output=True, text=True
+        )
+
+
+def test_service_action_exits_on_failure(capsys):
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=1, stderr="Unit not found")
+        with pytest.raises(SystemExit):
+            proxyctl.service_action("start")
+
+
+def test_use_writes_config_and_restarts(tmp_library, monkeypatch, tmp_path):
+    _populated_lib(tmp_library, monkeypatch)
+    config_path = tmp_path / "active.json"
+    monkeypatch.setattr(proxyctl, "SING_BOX_CONFIG", config_path)
+
+    with patch("proxyctl.service_action") as mock_sa, \
+         patch("subprocess.run") as mock_run, \
+         patch("time.sleep"):
+        mock_run.return_value = MagicMock(stdout="active\n", returncode=0)
+        proxyctl.cmd_use(_make_args(id=1, mode="socks"))
+
+    assert config_path.exists()
+    cfg = json.loads(config_path.read_text())
+    assert cfg["route"]["final"] is not None
+    mock_sa.assert_called_with("restart")
+
+
+def test_use_tun_mode_config(tmp_library, monkeypatch, tmp_path):
+    _populated_lib(tmp_library, monkeypatch)
+    config_path = tmp_path / "active.json"
+    monkeypatch.setattr(proxyctl, "SING_BOX_CONFIG", config_path)
+
+    with patch("proxyctl.service_action"), \
+         patch("subprocess.run") as mock_run, \
+         patch("time.sleep"):
+        mock_run.return_value = MagicMock(stdout="active\n", returncode=0)
+        proxyctl.cmd_use(_make_args(id=1, mode="tun"))
+
+    cfg = json.loads(config_path.read_text())
+    inbound_types = [i["type"] for i in cfg["inbounds"]]
+    assert "tun" in inbound_types
+
+
+def test_use_nonexistent_id_exits(tmp_library, monkeypatch):
+    monkeypatch.setattr(proxyctl, "PROXIES_FILE", tmp_library)
+    with pytest.raises(SystemExit):
+        proxyctl.cmd_use(_make_args(id=999, mode="socks"))
+
+
+def test_use_prints_log_on_start_failure(tmp_library, monkeypatch, tmp_path):
+    _populated_lib(tmp_library, monkeypatch)
+    monkeypatch.setattr(proxyctl, "SING_BOX_CONFIG", tmp_path / "active.json")
+
+    with patch("proxyctl.service_action"), \
+         patch("subprocess.run") as mock_run, \
+         patch("time.sleep"):
+        mock_run.return_value = MagicMock(stdout="failed\n", returncode=1)
+        with pytest.raises(SystemExit):
+            proxyctl.cmd_use(_make_args(id=1, mode="socks"))
+
+
+def test_status_no_active(tmp_library, monkeypatch, capsys):
+    monkeypatch.setattr(proxyctl, "PROXIES_FILE", tmp_library)
+    proxyctl.cmd_status(_make_args())
+    out = capsys.readouterr().out
+    assert "No active" in out or "none" in out.lower()
+
+
+def test_status_with_active(tmp_library, monkeypatch, capsys):
+    _populated_lib(tmp_library, monkeypatch)
+    save_state({"active_id": 1, "mode": "socks"})
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(stdout="active\n", returncode=0)
+        proxyctl.cmd_status(_make_args())
+    out = capsys.readouterr().out
+    assert "vless" in out or "1" in out
+
+
+# ── tcp_test / test commands ──────────────────────────────────────────────────
+
+def test_tcp_test_success():
+    with patch("socket.create_connection") as mock_conn:
+        mock_conn.return_value = MagicMock()
+        result = proxyctl.tcp_test("1.2.3.4", 443, timeout=2.0)
+    assert result is not None
+    assert result >= 0
+
+
+def test_tcp_test_failure():
+    with patch("socket.create_connection", side_effect=OSError("refused")):
+        result = proxyctl.tcp_test("1.2.3.4", 443, timeout=2.0)
+    assert result is None
+
+
+def test_cmd_test_ok(tmp_library, monkeypatch, capsys):
+    _populated_lib(tmp_library, monkeypatch)
+    with patch("proxyctl.tcp_test", return_value=42.0):
+        proxyctl.cmd_test(_make_args(id=1, timeout=5.0))
+    out = capsys.readouterr().out
+    assert "OK" in out
+    assert "42" in out
+
+
+def test_cmd_test_fail_exits(tmp_library, monkeypatch):
+    _populated_lib(tmp_library, monkeypatch)
+    with patch("proxyctl.tcp_test", return_value=None):
+        with pytest.raises(SystemExit):
+            proxyctl.cmd_test(_make_args(id=1, timeout=5.0))
+
+
+def test_cmd_test_all_output(tmp_library, monkeypatch, capsys):
+    _populated_lib(tmp_library, monkeypatch)
+    with patch("proxyctl.tcp_test", side_effect=[10.0, None, 20.0]):
+        proxyctl.cmd_test_all(_make_args(timeout=5.0))
+    out = capsys.readouterr().out
+    assert "OK" in out
+    assert "FAIL" in out
+
+
+def test_cmd_test_active_ok(tmp_library, monkeypatch, capsys):
+    _populated_lib(tmp_library, monkeypatch)
+    save_state({"active_id": 1, "mode": "socks"})
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"query": "1.2.3.4", "country": "Russia", "isp": "TestISP"}
+    with patch("proxyctl.requests") as mock_req:
+        mock_req.get.return_value = mock_resp
+        proxyctl.cmd_test_active(_make_args(timeout=10.0))
+    out = capsys.readouterr().out
+    assert "OK" in out
+    assert "1.2.3.4" in out
+
+
+def test_cmd_test_active_no_active(tmp_library, monkeypatch):
+    monkeypatch.setattr(proxyctl, "PROXIES_FILE", tmp_library)
+    with pytest.raises(SystemExit):
+        proxyctl.cmd_test_active(_make_args(timeout=10.0))

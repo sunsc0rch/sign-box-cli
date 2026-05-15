@@ -15,6 +15,12 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
+try:
+    import requests as _requests_module
+    requests = _requests_module
+except ImportError:
+    requests = None  # type: ignore
+
 CONFIG_DIR = Path.home() / ".config" / "proxyctl"
 PROXIES_FILE = CONFIG_DIR / "proxies.json"
 STATE_FILE = CONFIG_DIR / "state.json"
@@ -358,16 +364,28 @@ def generate_active_config(outbound: dict, mode: str = "socks") -> dict:
 # ── Service Management ───────────────────────────────────────────────────────
 
 def service_action(action: str):
-    pass  # Task 10
+    result = subprocess.run(
+        ["systemctl", action, "sing-box"], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"Error running systemctl {action}: {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
 
 def cmd_logs(args):
-    pass  # Task 10
+    os.execvp("journalctl", ["journalctl", "-u", "sing-box", "-n", "50", "--no-pager"])
 
 
 # ── TCP Test ─────────────────────────────────────────────────────────────────
 
 def tcp_test(host: str, port: int, timeout: float = 5.0) -> Optional[float]:
-    pass  # Task 11
+    try:
+        start = time.time()
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.close()
+        return (time.time() - start) * 1000
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return None
 
 
 # ── CLI Commands ─────────────────────────────────────────────────────────────
@@ -409,13 +427,161 @@ def cmd_add(args):
     print(msg)
 
 
-def cmd_list(args):    pass
-def cmd_show(args):    pass
-def cmd_use(args):     pass
-def cmd_status(args):  pass
-def cmd_test(args):    pass
-def cmd_test_all(args): pass
-def cmd_test_active(args): pass
+def cmd_list(args):
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    proxies = lib.all()
+
+    if getattr(args, "protocol", None):
+        proxies = [(id_, v) for id_, v in proxies if v["protocol"] == args.protocol]
+    if getattr(args, "country", None):
+        proxies = [(id_, v) for id_, v in proxies if v["country"] == args.country.upper()]
+
+    if not proxies:
+        print("No proxies found.")
+        return
+
+    print(f"{'ID':>4}  {'Protocol':<14}  {'Country':<4}  {'Host':<38}  {'Port'}  Tag")
+    print("─" * 90)
+    for id_, v in proxies:
+        print(
+            f"{id_:>4}  {v['protocol']:<14}  {v.get('country') or '??':<4}  "
+            f"{v['host']:<38}  {v['port']:<6}  {v['tag'][:40]}"
+        )
+
+
+def cmd_show(args):
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    proxy = lib.get(args.id)
+    if not proxy:
+        print(f"Error: proxy {args.id} not found.", file=sys.stderr)
+        sys.exit(1)
+    print(f"ID:       {args.id}")
+    print(f"Protocol: {proxy['protocol']}")
+    print(f"Tag:      {proxy['tag']}")
+    print(f"Host:     {proxy['host']}:{proxy['port']}")
+    print(f"Country:  {proxy.get('country') or '(unknown)'}")
+    print(f"URI:      {proxy['raw_uri'][:80]}")
+    print(f"\nOutbound config:")
+    print(json.dumps(proxy["outbound"], indent=2, ensure_ascii=False))
+
+
+def cmd_use(args):
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    proxy = lib.get(args.id)
+    if not proxy:
+        print(f"Error: proxy {args.id} not found.", file=sys.stderr)
+        sys.exit(1)
+
+    config = generate_active_config(proxy["outbound"], mode=args.mode)
+    SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    SING_BOX_CONFIG.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    save_state({"active_id": args.id, "mode": args.mode})
+
+    service_action("restart")
+    time.sleep(1)
+
+    result = subprocess.run(
+        ["systemctl", "is-active", "sing-box"], capture_output=True, text=True
+    )
+    if result.stdout.strip() != "active":
+        print("sing-box failed to start. Last logs:")
+        subprocess.run(["journalctl", "-u", "sing-box", "-n", "10", "--no-pager"])
+        sys.exit(1)
+
+    print(
+        f"Active: [{args.id}] {proxy['tag']} | {proxy['protocol']} "
+        f"| {proxy['host']}:{proxy['port']} | mode={args.mode}"
+    )
+
+
+def cmd_status(args):
+    state = load_state()
+    active_id = state.get("active_id")
+
+    if active_id is None:
+        print("No active proxy.")
+        return
+
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    proxy = lib.get(active_id)
+    if not proxy:
+        print(f"Active proxy ID={active_id} not found in library (may have been removed).")
+        return
+
+    result = subprocess.run(
+        ["systemctl", "is-active", "sing-box"], capture_output=True, text=True
+    )
+    svc_status = result.stdout.strip()
+
+    print(f"Active proxy: [{active_id}] {proxy['tag']}")
+    print(f"Protocol:     {proxy['protocol']}")
+    print(f"Host:         {proxy['host']}:{proxy['port']}")
+    print(f"Mode:         {state.get('mode', 'socks')}")
+    print(f"sing-box:     {svc_status}")
+    print(f"HTTP proxy:   http://127.0.0.1:7890")
+    print(f"SOCKS5 proxy: socks5://127.0.0.1:7891")
+
+
+def cmd_test(args):
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    proxy = lib.get(args.id)
+    if not proxy:
+        print(f"Error: proxy {args.id} not found.", file=sys.stderr)
+        sys.exit(1)
+    host = proxy["host"]
+    port = proxy["port"]
+    print(f"Testing [{args.id}] {proxy['tag']} → {host}:{port} ...", end=" ", flush=True)
+    latency = tcp_test(host, port, args.timeout)
+    if latency is not None:
+        print(f"OK  {latency:.0f}ms")
+    else:
+        print("FAIL")
+        sys.exit(1)
+
+
+def cmd_test_all(args):
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    proxies = lib.all()
+    if not proxies:
+        print("No proxies in library.")
+        return
+    print(f"{'ID':>4}  {'Protocol':<14}  {'Country':<4}  {'Host':<38}  {'Port'}  Result")
+    print("─" * 90)
+    for id_, proxy in proxies:
+        latency = tcp_test(proxy["host"], proxy["port"], args.timeout)
+        result = f"OK  {latency:.0f}ms" if latency is not None else "FAIL"
+        print(
+            f"{id_:>4}  {proxy['protocol']:<14}  {proxy.get('country') or '??':<4}  "
+            f"{proxy['host']:<38}  {proxy['port']:<6}  {result}"
+        )
+
+
+def cmd_test_active(args):
+    state = load_state()
+    if state.get("active_id") is None:
+        print("No active proxy. Use 'proxyctl use <id>' first.", file=sys.stderr)
+        sys.exit(1)
+    if requests is None:
+        print("Error: 'requests' library not installed. Run: pip install requests", file=sys.stderr)
+        sys.exit(1)
+
+    proxy_url = "socks5://127.0.0.1:7891"
+    test_url = "http://ip-api.com/json"
+    try:
+        resp = requests.get(
+            test_url,
+            proxies={"http": proxy_url, "https": proxy_url},
+            timeout=args.timeout,
+        )
+        data = resp.json()
+        print(
+            f"OK — IP: {data.get('query', '?')} | "
+            f"Country: {data.get('country', '?')} | "
+            f"ISP: {data.get('isp', '?')}"
+        )
+    except Exception as e:
+        print(f"FAIL: {e}", file=sys.stderr)
+        sys.exit(1)
 def cmd_remove(args):
     lib = ProxyLibrary(PROXIES_FILE).load()
     state = load_state()
