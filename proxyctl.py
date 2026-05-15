@@ -88,7 +88,46 @@ def parse_vless(uri: str) -> dict:
     return outbound
 
 def parse_vmess(uri: str) -> dict:
-    pass  # Task 3
+    b64 = uri[8:]  # strip "vmess://"
+    b64 += "=" * (-len(b64) % 4)
+    data = json.loads(base64.b64decode(b64).decode())
+
+    host = data.get("add", "")
+    port = int(data.get("port", 443))
+    tag = data.get("ps", f"vmess-{host}")
+    net = data.get("net", "tcp")
+
+    outbound: dict = {
+        "type": "vmess",
+        "tag": tag,
+        "server": host,
+        "server_port": port,
+        "uuid": data.get("id", ""),
+        "security": data.get("scy", "auto"),
+        "alter_id": int(data.get("aid", 0)),
+    }
+
+    if data.get("tls") == "tls":
+        sni = data.get("sni") or data.get("host", "")
+        tls: dict = {"enabled": True}
+        if sni:
+            tls["server_name"] = sni
+        outbound["tls"] = tls
+
+    if net == "ws":
+        transport: dict = {"type": "ws", "path": data.get("path", "/")}
+        ws_host = data.get("host", "")
+        if ws_host:
+            transport["headers"] = {"Host": ws_host}
+        outbound["transport"] = transport
+    elif net == "grpc":
+        svc = data.get("path", "")
+        transport = {"type": "grpc"}
+        if svc:
+            transport["service_name"] = svc
+        outbound["transport"] = transport
+
+    return outbound
 
 def parse_ss(uri: str) -> dict:
     pass  # Task 4
