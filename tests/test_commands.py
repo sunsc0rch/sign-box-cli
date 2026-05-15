@@ -292,3 +292,42 @@ def test_cmd_test_active_no_active(tmp_library, monkeypatch):
     monkeypatch.setattr(proxyctl, "PROXIES_FILE", tmp_library)
     with pytest.raises(SystemExit):
         proxyctl.cmd_test_active(_make_args(timeout=10.0))
+
+
+# ── tun ──────────────────────────────────────────────────────────────────────
+
+def test_tun_on(tmp_library, monkeypatch, tmp_path):
+    _populated_lib(tmp_library, monkeypatch)
+    save_state({"active_id": 1, "mode": "socks"})
+    config_path = tmp_path / "active.json"
+    monkeypatch.setattr(proxyctl, "SING_BOX_CONFIG", config_path)
+
+    with patch("proxyctl.service_action") as mock_sa:
+        proxyctl.cmd_tun(_make_args(action="on"))
+
+    cfg = json.loads(config_path.read_text())
+    inbound_types = [i["type"] for i in cfg["inbounds"]]
+    assert "tun" in inbound_types
+    assert load_state()["mode"] == "tun"
+    mock_sa.assert_called_with("restart")
+
+
+def test_tun_off(tmp_library, monkeypatch, tmp_path):
+    _populated_lib(tmp_library, monkeypatch)
+    save_state({"active_id": 1, "mode": "tun"})
+    config_path = tmp_path / "active.json"
+    monkeypatch.setattr(proxyctl, "SING_BOX_CONFIG", config_path)
+
+    with patch("proxyctl.service_action"):
+        proxyctl.cmd_tun(_make_args(action="off"))
+
+    cfg = json.loads(config_path.read_text())
+    inbound_types = [i["type"] for i in cfg["inbounds"]]
+    assert "tun" not in inbound_types
+    assert load_state()["mode"] == "socks"
+
+
+def test_tun_no_active_exits(tmp_library, monkeypatch):
+    monkeypatch.setattr(proxyctl, "PROXIES_FILE", tmp_library)
+    with pytest.raises(SystemExit):
+        proxyctl.cmd_tun(_make_args(action="on"))

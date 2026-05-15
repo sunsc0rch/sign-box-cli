@@ -611,8 +611,85 @@ def cmd_remove(args):
 
     lib.save()
     print(f"Removed {removed} proxy(ies).")
-def cmd_tun(args):     pass
-def cmd_install(args): pass
+def cmd_tun(args):
+    state = load_state()
+    if state.get("active_id") is None:
+        print("No active proxy. Use 'proxyctl use <id>' first.", file=sys.stderr)
+        sys.exit(1)
+
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    proxy = lib.get(state["active_id"])
+    if not proxy:
+        print("Active proxy not found in library.", file=sys.stderr)
+        sys.exit(1)
+
+    new_mode = "tun" if args.action == "on" else "socks"
+    config = generate_active_config(proxy["outbound"], mode=new_mode)
+    SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    SING_BOX_CONFIG.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    save_state({"active_id": state["active_id"], "mode": new_mode})
+    service_action("restart")
+    print(f"TUN mode {'enabled' if args.action == 'on' else 'disabled'}.")
+
+
+def cmd_install(args):
+    import tarfile as _tarfile
+    import tempfile
+
+    print("Fetching latest sing-box release from GitHub...")
+    api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+    with urllib.request.urlopen(api_url) as resp:
+        release = json.loads(resp.read())
+
+    asset = next(
+        (a for a in release["assets"]
+         if "linux-amd64" in a["name"] and a["name"].endswith(".tar.gz")),
+        None,
+    )
+    if not asset:
+        print("Error: could not find linux-amd64 release asset.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Downloading {asset['name']}...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        archive = os.path.join(tmpdir, asset["name"])
+        urllib.request.urlretrieve(asset["browser_download_url"], archive)
+
+        with _tarfile.open(archive) as tf:
+            member = next(
+                m for m in tf.getmembers()
+                if m.name.endswith("/sing-box") or m.name == "sing-box"
+            )
+            member.name = "sing-box"
+            tf.extract(member, tmpdir)
+
+        subprocess.run(
+            ["install", "-m", "755", os.path.join(tmpdir, "sing-box"), SING_BOX_BIN],
+            check=True,
+        )
+
+    print(f"Installed: {SING_BOX_BIN}")
+
+    Path("/etc/sing-box").mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    unit = (
+        "[Unit]\n"
+        "Description=sing-box proxy service\n"
+        "After=network.target\n\n"
+        "[Service]\n"
+        f"ExecStart={SING_BOX_BIN} run -c /etc/sing-box/active.json\n"
+        "Restart=on-failure\n"
+        "RestartSec=3s\n"
+        "User=root\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+    Path("/etc/systemd/system/sing-box.service").write_text(unit)
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "sing-box"], check=True)
+    print("sing-box service installed and enabled.")
+    print("Run: proxyctl add <file.txt> to load proxies.")
 
 
 # ── Entry Point ──────────────────────────────────────────────────────────────
