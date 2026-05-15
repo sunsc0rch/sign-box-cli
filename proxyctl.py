@@ -130,16 +130,114 @@ def parse_vmess(uri: str) -> dict:
     return outbound
 
 def parse_ss(uri: str) -> dict:
-    pass  # Task 4
+    parsed = urllib.parse.urlparse(uri)
+    tag = urllib.parse.unquote(parsed.fragment) if parsed.fragment else ""
+
+    if parsed.hostname:
+        # ss://BASE64@host:port or ss://method:password@host:port
+        userinfo = parsed.username or ""
+        try:
+            padded = userinfo + "=" * (-len(userinfo) % 4)
+            decoded = base64.b64decode(padded).decode()
+            method, password = decoded.split(":", 1)
+        except Exception:
+            method = userinfo
+            password = urllib.parse.unquote(parsed.password or "")
+        host = parsed.hostname
+        port = parsed.port
+    else:
+        # ss://BASE64 (no @) — legacy format
+        b64_part = uri.split("//", 1)[1].split("#")[0]
+        b64_part += "=" * (-len(b64_part) % 4)
+        decoded = base64.b64decode(b64_part).decode()
+        user_part, host_part = decoded.rsplit("@", 1)
+        method, password = user_part.split(":", 1)
+        if ":" in host_part:
+            host, port_str = host_part.rsplit(":", 1)
+            port = int(port_str)
+        else:
+            host, port = host_part, 443
+
+    tag = tag or f"ss-{host}"
+    return {
+        "type": "shadowsocks",
+        "tag": tag,
+        "server": host,
+        "server_port": int(port),
+        "method": method,
+        "password": password,
+    }
 
 def parse_trojan(uri: str) -> dict:
-    pass  # Task 4
+    parsed = urllib.parse.urlparse(uri)
+    tag = urllib.parse.unquote(parsed.fragment) if parsed.fragment else ""
+    params = dict(urllib.parse.parse_qsl(parsed.query))
+    host = parsed.hostname
+    port = parsed.port
+    password = urllib.parse.unquote(parsed.username or "")
+    tag = tag or f"trojan-{host}"
+
+    outbound: dict = {
+        "type": "trojan",
+        "tag": tag,
+        "server": host,
+        "server_port": port,
+        "password": password,
+    }
+
+    tls: dict = {"enabled": True}
+    sni = params.get("sni", "")
+    if sni:
+        tls["server_name"] = sni
+    if params.get("allowInsecure") == "1":
+        tls["insecure"] = True
+    outbound["tls"] = tls
+
+    transport_type = params.get("type", "tcp")
+    if transport_type == "ws":
+        transport: dict = {"type": "ws", "path": params.get("path", "/")}
+        host_header = params.get("host", "")
+        if host_header:
+            transport["headers"] = {"Host": host_header}
+        outbound["transport"] = transport
+
+    return outbound
 
 def parse_hysteria2(uri: str) -> dict:
-    pass  # Task 5
+    normalized = uri.replace("hy2://", "hysteria2://", 1)
+    parsed = urllib.parse.urlparse(normalized)
+    tag = urllib.parse.unquote(parsed.fragment) if parsed.fragment else ""
+    params = dict(urllib.parse.parse_qsl(parsed.query))
+    host = parsed.hostname
+    port = parsed.port
+    password = urllib.parse.unquote(parsed.username or "")
+    tag = tag or f"hy2-{host}"
+
+    outbound: dict = {
+        "type": "hysteria2",
+        "tag": tag,
+        "server": host,
+        "server_port": port,
+        "password": password,
+    }
+
+    tls: dict = {"enabled": True}
+    sni = params.get("sni", "")
+    if sni:
+        tls["server_name"] = sni
+    if params.get("insecure") == "1":
+        tls["insecure"] = True
+    outbound["tls"] = tls
+
+    return outbound
 
 def extract_country(tag: str) -> str:
-    pass  # Task 5
+    # Regional indicator symbols: U+1F1E6 (A) to U+1F1FF (Z)
+    # Two consecutive indicators = one country flag
+    flags = re.findall(r"[\U0001F1E6-\U0001F1FF]{2}", tag)
+    if not flags:
+        return ""
+    return "".join(chr(ord(c) - 0x1F1E6 + ord("A")) for c in flags[0])
 
 def parse_uri(uri: str) -> dict:
     pass  # Task 6
