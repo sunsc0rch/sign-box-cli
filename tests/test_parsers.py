@@ -1,6 +1,8 @@
+import base64
+import json as _json
 import pytest
 from conftest import VLESS_REALITY, VLESS_WS, VLESS_TLS_TCP
-from proxyctl import parse_vless
+from proxyctl import parse_vless, parse_vmess
 
 
 def test_vless_reality_basic_fields():
@@ -70,8 +72,6 @@ def test_vless_grpc_no_service_name():
     assert "service_name" not in out["transport"]
 
 
-import base64, json as _json
-from proxyctl import parse_vmess
 
 def _make_vmess(overrides: dict) -> str:
     data = {
