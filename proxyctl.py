@@ -372,7 +372,43 @@ def tcp_test(host: str, port: int, timeout: float = 5.0) -> Optional[float]:
 
 # ── CLI Commands ─────────────────────────────────────────────────────────────
 
-def cmd_add(args):     pass
+def cmd_add(args):
+    source = args.source
+    uris: list = []
+
+    if source.startswith(("vless://", "vmess://", "ss://", "trojan://", "hysteria2://", "hy2://")):
+        uris = [source]
+    else:
+        path = Path(source)
+        if not path.exists():
+            print(f"Error: file not found: {source}", file=sys.stderr)
+            sys.exit(1)
+        uris = path.read_text(encoding="utf-8").splitlines()
+
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    added = 0
+    skipped = 0
+
+    for uri in uris:
+        uri = uri.strip()
+        if not uri:
+            continue
+        try:
+            outbound = parse_uri(uri)
+            entry = build_library_entry(uri, outbound)
+            lib.add(entry)
+            added += 1
+        except Exception as e:
+            print(f"  skip: {uri[:60]!r} — {e}", file=sys.stderr)
+            skipped += 1
+
+    lib.save()
+    msg = f"Added {added}"
+    if skipped:
+        msg += f", skipped {skipped}"
+    print(msg)
+
+
 def cmd_list(args):    pass
 def cmd_show(args):    pass
 def cmd_use(args):     pass
@@ -380,7 +416,35 @@ def cmd_status(args):  pass
 def cmd_test(args):    pass
 def cmd_test_all(args): pass
 def cmd_test_active(args): pass
-def cmd_remove(args):  pass
+def cmd_remove(args):
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    state = load_state()
+    active_id = state.get("active_id")
+
+    to_remove: list = []
+
+    if getattr(args, "all", False):
+        to_remove = [id_ for id_, _ in lib.all()]
+    elif getattr(args, "protocol", None):
+        to_remove = [id_ for id_, v in lib.all() if v["protocol"] == args.protocol]
+    elif getattr(args, "country", None):
+        to_remove = [id_ for id_, v in lib.all() if v["country"] == args.country.upper()]
+    else:
+        to_remove = list(args.ids)
+
+    removed = 0
+    for id_ in to_remove:
+        if id_ == active_id:
+            print(f"Warning: removing active proxy [{id_}] — stopping sing-box.")
+            service_action("stop")
+            save_state({"active_id": None, "mode": "socks"})
+        if lib.remove(id_):
+            removed += 1
+        else:
+            print(f"Warning: proxy {id_} not found.", file=sys.stderr)
+
+    lib.save()
+    print(f"Removed {removed} proxy(ies).")
 def cmd_tun(args):     pass
 def cmd_install(args): pass
 
