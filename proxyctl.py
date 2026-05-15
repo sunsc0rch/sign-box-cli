@@ -55,11 +55,14 @@ def parse_vless(uri: str) -> dict:
         if fp:
             tls["utls"] = {"enabled": True, "fingerprint": fp}
         if security == "reality":
-            tls["reality"] = {
-                "enabled": True,
-                "public_key": params.get("pbk", ""),
-                "short_id": params.get("sid", ""),
-            }
+            reality: dict = {"enabled": True}
+            pbk = params.get("pbk", "")
+            sid = params.get("sid", "")
+            if pbk:
+                reality["public_key"] = pbk
+            if sid:
+                reality["short_id"] = sid
+            tls["reality"] = reality
         elif params.get("allowInsecure") == "1":
             tls["insecure"] = True
     if tls:
@@ -76,10 +79,11 @@ def parse_vless(uri: str) -> dict:
             transport["headers"] = {"Host": host_header}
         outbound["transport"] = transport
     elif transport_type == "grpc":
-        outbound["transport"] = {
-            "type": "grpc",
-            "service_name": params.get("serviceName", ""),
-        }
+        transport = {"type": "grpc"}
+        svc = params.get("serviceName", "")
+        if svc:
+            transport["service_name"] = svc
+        outbound["transport"] = transport
 
     return outbound
 

@@ -51,3 +51,20 @@ def test_vless_tls_tcp_insecure():
 def test_vless_tag_from_fragment():
     out = parse_vless(VLESS_REALITY)
     assert "RUS" in out["tag"]
+
+
+def test_vless_grpc_transport():
+    uri = (
+        "vless://uuid@host:443?type=grpc&serviceName=my-service"
+        "&security=tls&sni=host#grpc-test"
+    )
+    out = parse_vless(uri)
+    assert out["transport"]["type"] == "grpc"
+    assert out["transport"]["service_name"] == "my-service"
+
+
+def test_vless_grpc_no_service_name():
+    uri = "vless://uuid@host:443?type=grpc&security=tls&sni=host#grpc-empty"
+    out = parse_vless(uri)
+    assert out["transport"]["type"] == "grpc"
+    assert "service_name" not in out["transport"]
