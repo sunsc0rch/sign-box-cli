@@ -240,25 +240,89 @@ def extract_country(tag: str) -> str:
     return "".join(chr(ord(c) - 0x1F1E6 + ord("A")) for c in flags[0])
 
 def parse_uri(uri: str) -> dict:
-    pass  # Task 6
+    uri = uri.strip()
+    if uri.startswith("vless://"):
+        return parse_vless(uri)
+    elif uri.startswith("vmess://"):
+        return parse_vmess(uri)
+    elif uri.startswith("ss://"):
+        return parse_ss(uri)
+    elif uri.startswith("trojan://"):
+        return parse_trojan(uri)
+    elif uri.startswith("hysteria2://") or uri.startswith("hy2://"):
+        return parse_hysteria2(uri)
+    else:
+        raise ValueError(f"Unsupported URI scheme: {uri[:30]!r}")
+
 
 def build_library_entry(uri: str, outbound: dict) -> dict:
-    pass  # Task 6
+    normalized = uri.replace("hy2://", "hysteria2://", 1)
+    parsed = urllib.parse.urlparse(normalized)
+    fragment = urllib.parse.unquote(parsed.fragment or "")
+    protocol = outbound["type"]
+    if protocol == "shadowsocks":
+        protocol = "ss"
+    return {
+        "protocol": protocol,
+        "tag": outbound.get("tag", ""),
+        "host": outbound.get("server", ""),
+        "port": outbound.get("server_port", 0),
+        "country": extract_country(fragment),
+        "raw_uri": uri,
+        "outbound": outbound,
+    }
 
 
 # ── Proxy Library ────────────────────────────────────────────────────────────
 
 class ProxyLibrary:
-    pass  # Task 6
+    def __init__(self, path: Path = PROXIES_FILE):
+        self.path = path
+        self._data: dict = {"next_id": 1, "proxies": {}}
+
+    def load(self) -> "ProxyLibrary":
+        if self.path.exists():
+            self._data = json.loads(self.path.read_text())
+        return self
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self._data, indent=2, ensure_ascii=False))
+
+    def add(self, entry: dict) -> int:
+        id_ = self._data["next_id"]
+        self._data["proxies"][str(id_)] = entry
+        self._data["next_id"] += 1
+        return id_
+
+    def get(self, id_: int) -> Optional[dict]:
+        return self._data["proxies"].get(str(id_))
+
+    def all(self) -> list:
+        return [(int(k), v) for k, v in self._data["proxies"].items()]
+
+    def remove(self, id_: int) -> bool:
+        key = str(id_)
+        if key in self._data["proxies"]:
+            del self._data["proxies"][key]
+            return True
+        return False
+
+    def clear(self):
+        self._data["proxies"] = {}
 
 
 # ── State ────────────────────────────────────────────────────────────────────
 
 def load_state() -> dict:
-    pass  # Task 6
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {"active_id": None, "mode": "socks"}
+
 
 def save_state(state: dict):
-    pass  # Task 6
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
 # ── Config Generator ─────────────────────────────────────────────────────────
