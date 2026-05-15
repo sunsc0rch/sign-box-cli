@@ -25,7 +25,63 @@ SING_BOX_BIN = "/usr/local/bin/sing-box"
 # ── URI Parsers ──────────────────────────────────────────────────────────────
 
 def parse_vless(uri: str) -> dict:
-    pass  # Task 2
+    parsed = urllib.parse.urlparse(uri)
+    uuid = parsed.username
+    host = parsed.hostname
+    port = parsed.port
+    tag = urllib.parse.unquote(parsed.fragment) if parsed.fragment else f"vless-{host}"
+    params = dict(urllib.parse.parse_qsl(parsed.query))
+
+    outbound: dict = {
+        "type": "vless",
+        "tag": tag,
+        "server": host,
+        "server_port": port,
+        "uuid": uuid,
+    }
+
+    flow = params.get("flow", "")
+    if flow:
+        outbound["flow"] = flow
+
+    security = params.get("security", "")
+    tls: dict = {}
+    if security in ("tls", "reality"):
+        tls["enabled"] = True
+        sni = params.get("sni", "")
+        if sni:
+            tls["server_name"] = sni
+        fp = params.get("fp", "")
+        if fp:
+            tls["utls"] = {"enabled": True, "fingerprint": fp}
+        if security == "reality":
+            tls["reality"] = {
+                "enabled": True,
+                "public_key": params.get("pbk", ""),
+                "short_id": params.get("sid", ""),
+            }
+        elif params.get("allowInsecure") == "1":
+            tls["insecure"] = True
+    if tls:
+        outbound["tls"] = tls
+
+    transport_type = params.get("type", "tcp")
+    if transport_type == "ws":
+        transport: dict = {
+            "type": "ws",
+            "path": urllib.parse.unquote(params.get("path", "/")),
+        }
+        host_header = params.get("host", "")
+        if host_header:
+            transport["headers"] = {"Host": host_header}
+        outbound["transport"] = transport
+    elif transport_type == "grpc":
+        outbound["transport"] = {
+            "type": "grpc",
+            "service_name": params.get("serviceName", ""),
+        }
+
+    return outbound
 
 def parse_vmess(uri: str) -> dict:
     pass  # Task 3
