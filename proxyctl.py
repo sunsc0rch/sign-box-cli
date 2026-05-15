@@ -328,7 +328,31 @@ def save_state(state: dict):
 # ── Config Generator ─────────────────────────────────────────────────────────
 
 def generate_active_config(outbound: dict, mode: str = "socks") -> dict:
-    pass  # Task 7
+    inbounds = [
+        {"type": "http",  "tag": "http-in",  "listen": "::", "listen_port": 7890},
+        {"type": "socks", "tag": "socks-in", "listen": "::", "listen_port": 7891},
+        {"type": "mixed", "tag": "mixed-in", "listen": "::", "listen_port": 7892},
+    ]
+    if mode == "tun":
+        inbounds.append({
+            "type": "tun",
+            "tag": "tun-in",
+            "inet4_address": "172.19.0.1/30",
+            "auto_route": True,
+            "strict_route": True,
+            "sniff": True,
+        })
+
+    return {
+        "log": {"level": "warn"},
+        "inbounds": inbounds,
+        "outbounds": [
+            outbound,
+            {"type": "direct", "tag": "direct"},
+            {"type": "block",  "tag": "block"},
+        ],
+        "route": {"final": outbound["tag"]},
+    }
 
 
 # ── Service Management ───────────────────────────────────────────────────────
