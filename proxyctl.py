@@ -461,7 +461,7 @@ def cmd_show(args):
     print(f"Host:     {proxy['host']}:{proxy['port']}")
     print(f"Country:  {proxy.get('country') or '(unknown)'}")
     print(f"URI:      {proxy['raw_uri'][:80]}")
-    print(f"\nOutbound config:")
+    print("\nOutbound config:")
     print(json.dumps(proxy["outbound"], indent=2, ensure_ascii=False))
 
 
@@ -474,17 +474,27 @@ def cmd_use(args):
 
     config = generate_active_config(proxy["outbound"], mode=args.mode)
     SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    SING_BOX_CONFIG.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    tmp = SING_BOX_CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    os.replace(tmp, SING_BOX_CONFIG)
     save_state({"active_id": args.id, "mode": args.mode})
 
     service_action("restart")
-    time.sleep(1)
-
-    result = subprocess.run(
-        ["systemctl", "is-active", "sing-box"], capture_output=True, text=True
-    )
-    if result.stdout.strip() != "active":
-        print("sing-box failed to start. Last logs:")
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        result = subprocess.run(
+            ["systemctl", "is-active", "sing-box"], capture_output=True, text=True
+        )
+        status = result.stdout.strip()
+        if status == "active":
+            break
+        if status in ("failed", "inactive"):
+            print("sing-box failed to start. Last logs:")
+            subprocess.run(["journalctl", "-u", "sing-box", "-n", "10", "--no-pager"])
+            sys.exit(1)
+        time.sleep(0.5)
+    else:
+        print("sing-box did not become active within 5s. Last logs:")
         subprocess.run(["journalctl", "-u", "sing-box", "-n", "10", "--no-pager"])
         sys.exit(1)
 
@@ -582,6 +592,8 @@ def cmd_test_active(args):
     except Exception as e:
         print(f"FAIL: {e}", file=sys.stderr)
         sys.exit(1)
+
+
 def cmd_remove(args):
     lib = ProxyLibrary(PROXIES_FILE).load()
     state = load_state()
@@ -600,17 +612,19 @@ def cmd_remove(args):
 
     removed = 0
     for id_ in to_remove:
-        if id_ == active_id:
-            print(f"Warning: removing active proxy [{id_}] — stopping sing-box.")
-            service_action("stop")
-            save_state({"active_id": None, "mode": "socks"})
         if lib.remove(id_):
             removed += 1
+            if id_ == active_id:
+                print(f"Warning: removed active proxy [{id_}] — stopping sing-box.")
+                service_action("stop")
+                save_state({"active_id": None, "mode": "socks"})
         else:
             print(f"Warning: proxy {id_} not found.", file=sys.stderr)
 
     lib.save()
     print(f"Removed {removed} proxy(ies).")
+
+
 def cmd_tun(args):
     state = load_state()
     if state.get("active_id") is None:
@@ -626,7 +640,9 @@ def cmd_tun(args):
     new_mode = "tun" if args.action == "on" else "socks"
     config = generate_active_config(proxy["outbound"], mode=new_mode)
     SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    SING_BOX_CONFIG.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    tmp = SING_BOX_CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    os.replace(tmp, SING_BOX_CONFIG)
     save_state({"active_id": state["active_id"], "mode": new_mode})
     service_action("restart")
     print(f"TUN mode {'enabled' if args.action == 'on' else 'disabled'}.")
@@ -661,7 +677,7 @@ def cmd_install(args):
                 if m.name.endswith("/sing-box") or m.name == "sing-box"
             )
             member.name = "sing-box"
-            tf.extract(member, tmpdir)
+            tf.extract(member, tmpdir, filter="data")
 
         subprocess.run(
             ["install", "-m", "755", os.path.join(tmpdir, "sing-box"), SING_BOX_BIN],
