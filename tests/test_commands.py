@@ -173,6 +173,7 @@ def test_use_writes_config_and_restarts(tmp_library, monkeypatch, tmp_path):
 
     with patch("proxyctl.service_action") as mock_sa, \
          patch("subprocess.run") as mock_run, \
+         patch("proxyctl.set_sysproxy"), \
          patch("time.sleep"):
         mock_run.return_value = MagicMock(stdout="active\n", returncode=0)
         proxyctl.cmd_use(_make_args(id=1, mode="socks"))
@@ -190,6 +191,7 @@ def test_use_tun_mode_config(tmp_library, monkeypatch, tmp_path):
 
     with patch("proxyctl.service_action"), \
          patch("subprocess.run") as mock_run, \
+         patch("proxyctl.set_sysproxy"), \
          patch("time.sleep"):
         mock_run.return_value = MagicMock(stdout="active\n", returncode=0)
         proxyctl.cmd_use(_make_args(id=1, mode="tun"))
@@ -211,6 +213,7 @@ def test_use_prints_log_on_start_failure(tmp_library, monkeypatch, tmp_path):
 
     with patch("proxyctl.service_action"), \
          patch("subprocess.run") as mock_run, \
+         patch("proxyctl.set_sysproxy"), \
          patch("time.sleep"):
         mock_run.return_value = MagicMock(stdout="failed\n", returncode=1)
         with pytest.raises(SystemExit):
@@ -332,3 +335,103 @@ def test_tun_no_active_exits(tmp_library, monkeypatch):
     monkeypatch.setattr(proxyctl, "PROXIES_FILE", tmp_library)
     with pytest.raises(SystemExit):
         proxyctl.cmd_tun(_make_args(action="on"))
+
+
+# ── sysproxy ─────────────────────────────────────────────────────────────────
+
+def test_set_env_proxy_on(tmp_library, monkeypatch, tmp_path):
+    env_file = tmp_path / "environment"
+    env_file.write_text("LANG=en_US.UTF-8\n")
+    monkeypatch.setattr(proxyctl, "STATE_FILE", tmp_path / "state.json")
+    with patch("proxyctl.Path") as mock_path_cls:
+        # Only intercept /etc/environment; let other Path calls through
+        real_path = Path
+        def path_side_effect(arg=""):
+            p = real_path(arg) if arg else real_path()
+            if str(arg) == "/etc/environment":
+                return env_file
+            return p
+        mock_path_cls.side_effect = path_side_effect
+        with patch("proxyctl._set_gnome_proxy", return_value=False):
+            proxyctl._set_env_proxy(True)
+
+    content = env_file.read_text()
+    assert "http_proxy=http://127.0.0.1:7890" in content
+    assert "HTTPS_PROXY=http://127.0.0.1:7890" in content
+    assert "no_proxy=" in content
+    assert "LANG=en_US.UTF-8" in content
+
+
+def test_set_env_proxy_off_removes_vars(tmp_path):
+    env_file = tmp_path / "environment"
+    env_file.write_text(
+        "LANG=en_US.UTF-8\n"
+        "http_proxy=http://127.0.0.1:7890\n"
+        "HTTP_PROXY=http://127.0.0.1:7890\n"
+        "https_proxy=http://127.0.0.1:7890\n"
+        "HTTPS_PROXY=http://127.0.0.1:7890\n"
+        "no_proxy=localhost,127.0.0.1,::1\n"
+        "NO_PROXY=localhost,127.0.0.1,::1\n"
+    )
+    with patch("proxyctl.Path") as mock_path_cls:
+        real_path = Path
+        def path_side_effect(arg=""):
+            p = real_path(arg) if arg else real_path()
+            if str(arg) == "/etc/environment":
+                return env_file
+            return p
+        mock_path_cls.side_effect = path_side_effect
+        proxyctl._set_env_proxy(False)
+
+    content = env_file.read_text()
+    assert "http_proxy" not in content
+    assert "HTTPS_PROXY" not in content
+    assert "LANG=en_US.UTF-8" in content
+
+
+def test_cmd_sysproxy_on(tmp_library, monkeypatch, capsys):
+    monkeypatch.setattr(proxyctl, "STATE_FILE", tmp_library.parent / "state.json")
+    with patch("proxyctl._set_gnome_proxy", return_value=True) as mock_gnome, \
+         patch("proxyctl._set_env_proxy", return_value=True) as mock_env:
+        proxyctl.cmd_sysproxy(_make_args(action="on"))
+    mock_gnome.assert_called_once_with(True)
+    mock_env.assert_called_once_with(True)
+    out = capsys.readouterr().out
+    assert "on" in out
+    state = load_state()
+    assert state.get("sysproxy") is True
+
+
+def test_cmd_sysproxy_off(tmp_library, monkeypatch, capsys):
+    monkeypatch.setattr(proxyctl, "STATE_FILE", tmp_library.parent / "state.json")
+    save_state({"active_id": None, "mode": "socks", "sysproxy": True})
+    with patch("proxyctl._set_gnome_proxy", return_value=True), \
+         patch("proxyctl._set_env_proxy", return_value=True):
+        proxyctl.cmd_sysproxy(_make_args(action="off"))
+    assert load_state().get("sysproxy") is False
+    out = capsys.readouterr().out
+    assert "off" in out
+
+
+def test_cmd_stop_disables_sysproxy(tmp_library, monkeypatch):
+    monkeypatch.setattr(proxyctl, "STATE_FILE", tmp_library.parent / "state.json")
+    save_state({"active_id": 1, "mode": "socks", "sysproxy": True})
+    with patch("proxyctl.service_action") as mock_sa, \
+         patch("proxyctl._set_gnome_proxy", return_value=True), \
+         patch("proxyctl._set_env_proxy", return_value=True):
+        proxyctl.cmd_stop(_make_args())
+    mock_sa.assert_called_once_with("stop")
+    assert load_state().get("sysproxy") is False
+
+
+def test_use_enables_sysproxy(tmp_library, monkeypatch, tmp_path):
+    _populated_lib(tmp_library, monkeypatch)
+    monkeypatch.setattr(proxyctl, "SING_BOX_CONFIG", tmp_path / "active.json")
+    with patch("proxyctl.service_action"), \
+         patch("subprocess.run") as mock_run, \
+         patch("proxyctl._set_gnome_proxy", return_value=True) as mock_gnome, \
+         patch("proxyctl._set_env_proxy", return_value=True), \
+         patch("time.sleep"):
+        mock_run.return_value = MagicMock(stdout="active\n", returncode=0)
+        proxyctl.cmd_use(_make_args(id=1, mode="socks"))
+    mock_gnome.assert_called_once_with(True)

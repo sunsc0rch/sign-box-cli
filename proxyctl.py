@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -465,6 +466,123 @@ def cmd_show(args):
     print(json.dumps(proxy["outbound"], indent=2, ensure_ascii=False))
 
 
+# ── System Proxy ─────────────────────────────────────────────────────────────
+
+_SYSPROXY_KEYS = {
+    "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY"
+}
+_NO_PROXY_LIST = "localhost,127.0.0.1,::1"
+
+
+def _gsettings_env() -> dict:
+    env = os.environ.copy()
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{os.getuid()}/bus"
+    return env
+
+
+def _set_gnome_proxy(enable: bool) -> bool:
+    if not shutil.which("gsettings"):
+        return False
+    env = _gsettings_env()
+    try:
+        if enable:
+            cmds = [
+                ["gsettings", "set", "org.gnome.system.proxy", "mode", "manual"],
+                ["gsettings", "set", "org.gnome.system.proxy.http", "host", "127.0.0.1"],
+                ["gsettings", "set", "org.gnome.system.proxy.http", "port", "7890"],
+                ["gsettings", "set", "org.gnome.system.proxy.https", "host", "127.0.0.1"],
+                ["gsettings", "set", "org.gnome.system.proxy.https", "port", "7890"],
+                ["gsettings", "set", "org.gnome.system.proxy.socks", "host", "127.0.0.1"],
+                ["gsettings", "set", "org.gnome.system.proxy.socks", "port", "7891"],
+                ["gsettings", "set", "org.gnome.system.proxy", "ignore-hosts",
+                 "['localhost', '127.0.0.0/8', '::1']"],
+            ]
+        else:
+            cmds = [["gsettings", "set", "org.gnome.system.proxy", "mode", "none"]]
+        for cmd in cmds:
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            if r.returncode != 0:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _set_env_proxy(enable: bool) -> bool:
+    env_file = Path("/etc/environment")
+    try:
+        text = env_file.read_text() if env_file.exists() else ""
+    except OSError:
+        return False
+    lines = [l for l in text.splitlines()
+             if not any(l.startswith(k + "=") for k in _SYSPROXY_KEYS)]
+    if enable:
+        proxy_val = "http://127.0.0.1:7890"
+        lines += [
+            f"http_proxy={proxy_val}",
+            f"https_proxy={proxy_val}",
+            f"HTTP_PROXY={proxy_val}",
+            f"HTTPS_PROXY={proxy_val}",
+            f"no_proxy={_NO_PROXY_LIST}",
+            f"NO_PROXY={_NO_PROXY_LIST}",
+        ]
+    try:
+        tmp = env_file.with_suffix(".tmp")
+        tmp.write_text("\n".join(lines) + ("\n" if lines else ""))
+        os.replace(tmp, env_file)
+        return True
+    except OSError:
+        return False
+
+
+def set_sysproxy(enable: bool) -> None:
+    gnome_ok = _set_gnome_proxy(enable)
+    env_ok = _set_env_proxy(enable)
+    word = "enabled" if enable else "disabled"
+    if gnome_ok:
+        print(f"  GNOME proxy: {word}")
+    if env_ok:
+        print(f"  /etc/environment: {word}")
+    if not gnome_ok and not env_ok:
+        print(
+            "  Warning: could not set system proxy "
+            "(gsettings unavailable or no write access to /etc/environment)",
+            file=sys.stderr,
+        )
+    state = load_state()
+    state["sysproxy"] = enable
+    save_state(state)
+
+
+def cmd_sysproxy(args):
+    if args.action == "on":
+        set_sysproxy(True)
+        print("System proxy: on → http://127.0.0.1:7890 / socks5://127.0.0.1:7891")
+    elif args.action == "off":
+        set_sysproxy(False)
+        print("System proxy: off")
+    elif args.action == "status":
+        state = load_state()
+        active = state.get("sysproxy", False)
+        print(f"System proxy: {'on' if active else 'off'}")
+        if shutil.which("gsettings"):
+            try:
+                r = subprocess.run(
+                    ["gsettings", "get", "org.gnome.system.proxy", "mode"],
+                    env=_gsettings_env(), capture_output=True, text=True,
+                )
+                if r.returncode == 0:
+                    print(f"  GNOME: {r.stdout.strip()}")
+            except Exception:
+                pass
+        env_file = Path("/etc/environment")
+        if env_file.exists():
+            content = env_file.read_text()
+            has_proxy = any(f"{k}=" in content for k in _SYSPROXY_KEYS)
+            print(f"  /etc/environment: {'proxy vars set' if has_proxy else 'no proxy vars'}")
+
+
 def cmd_use(args):
     lib = ProxyLibrary(PROXIES_FILE).load()
     proxy = lib.get(args.id)
@@ -502,6 +620,13 @@ def cmd_use(args):
         f"Active: [{args.id}] {proxy['tag']} | {proxy['protocol']} "
         f"| {proxy['host']}:{proxy['port']} | mode={args.mode}"
     )
+    print("Setting system proxy...")
+    set_sysproxy(True)
+
+
+def cmd_stop(args):
+    service_action("stop")
+    set_sysproxy(False)
 
 
 def cmd_status(args):
@@ -528,6 +653,7 @@ def cmd_status(args):
     print(f"Host:         {proxy['host']}:{proxy['port']}")
     print(f"Mode:         {state.get('mode', 'socks')}")
     print(f"sing-box:     {svc_status}")
+    print(f"System proxy: {'on' if state.get('sysproxy') else 'off'}")
     print(f"HTTP proxy:   http://127.0.0.1:7890")
     print(f"SOCKS5 proxy: socks5://127.0.0.1:7891")
 
@@ -728,6 +854,7 @@ def main():
     p = sub.add_parser("remove");   p.add_argument("ids", nargs="*", type=int); p.add_argument("--all", action="store_true"); p.add_argument("--protocol"); p.add_argument("--country")
     sub.add_parser("start"); sub.add_parser("stop"); sub.add_parser("restart"); sub.add_parser("logs")
     p = sub.add_parser("tun");      p.add_argument("action", choices=["on","off"])
+    p = sub.add_parser("sysproxy"); p.add_argument("action", choices=["on","off","status"])
     sub.add_parser("install")
 
     args = parser.parse_args()
@@ -737,9 +864,9 @@ def main():
         "test": cmd_test, "test-all": cmd_test_all, "test-active": cmd_test_active,
         "remove": cmd_remove,
         "start":   lambda a: service_action("start"),
-        "stop":    lambda a: service_action("stop"),
+        "stop":    cmd_stop,
         "restart": lambda a: service_action("restart"),
-        "logs": cmd_logs, "tun": cmd_tun, "install": cmd_install,
+        "logs": cmd_logs, "tun": cmd_tun, "sysproxy": cmd_sysproxy, "install": cmd_install,
     }
     dispatch[args.command](args)
 
