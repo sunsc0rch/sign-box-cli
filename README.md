@@ -7,7 +7,7 @@ CLI-обёртка над [sing-box](https://github.com/SagerNet/sing-box) дл�
 - Загрузка прокси из текстовых файлов с URI (`vless://`, `vmess://`, `ss://`, `trojan://`, `hysteria2://`)
 - Библиотека прокси с фильтрацией по протоколу и стране
 - Переключение активного прокси одной командой
-- Режим SOCKS5/HTTP (порты 7890/7891/7892) и TUN (прозрачный прокси)
+- Режим SOCKS5/HTTP (порты 7890/7891/7892), TUN (прозрачный прокси) и System Proxy (GNOME + `/etc/environment`)
 - Тест задержки (TCP) и end-to-end проверка через прокси
 - Единый Python-файл — деплой через `scp`
 
@@ -54,7 +54,7 @@ proxyctl show 3                   # полные параметры прокси
 ### Активация
 
 ```bash
-proxyctl use 5                    # переключиться на прокси #5
+proxyctl use 5                    # переключиться на прокси #5 (system proxy включается автоматически)
 proxyctl use 5 --mode tun         # то же, но в TUN-режиме
 proxyctl status                   # активный прокси + статус службы
 ```
@@ -68,11 +68,24 @@ proxyctl test-all --timeout 3     # с кастомным таймаутом
 proxyctl test-active              # HTTP-запрос через активный прокси
 ```
 
+### System Proxy
+
+Автоматически настраивает системный прокси при `proxyctl use` и снимает при `proxyctl stop`. Работает через два механизма одновременно:
+
+- **GNOME gsettings** — браузеры (Chrome, Firefox) и GTK-приложения подхватывают сразу
+- **/etc/environment** — переменные `http_proxy`/`HTTP_PROXY` для новых терминальных сессий и CLI-инструментов
+
+```bash
+proxyctl sysproxy on              # включить вручную
+proxyctl sysproxy off             # выключить вручную
+proxyctl sysproxy status          # текущее состояние (GNOME + /etc/environment)
+```
+
 ### Управление службой
 
 ```bash
 proxyctl start
-proxyctl stop
+proxyctl stop                     # останавливает прокси и снимает system proxy
 proxyctl restart
 proxyctl logs                     # последние 50 строк из journald
 ```
@@ -138,4 +151,4 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-87 тестов покрывают парсеры URI, библиотеку прокси, генератор конфигов и CLI-команды.
+93 теста покрывают парсеры URI, библиотеку прокси, генератор конфигов, CLI-команды и system proxy.
