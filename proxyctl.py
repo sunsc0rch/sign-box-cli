@@ -575,7 +575,7 @@ def cmd_test_active(args):
         print("Error: 'requests' library not installed. Run: pip install requests", file=sys.stderr)
         sys.exit(1)
 
-    proxy_url = "socks5://127.0.0.1:7891"
+    proxy_url = "http://127.0.0.1:7890"
     test_url = "http://ip-api.com/json"
     try:
         resp = requests.get(
@@ -583,6 +583,9 @@ def cmd_test_active(args):
             proxies={"http": proxy_url, "https": proxy_url},
             timeout=args.timeout,
         )
+        if resp.status_code != 200:
+            print(f"FAIL: upstream returned HTTP {resp.status_code}", file=sys.stderr)
+            sys.exit(1)
         data = resp.json()
         print(
             f"OK — IP: {data.get('query', '?')} | "
