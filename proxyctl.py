@@ -527,13 +527,20 @@ def _set_env_proxy(enable: bool) -> bool:
             f"no_proxy={_NO_PROXY_LIST}",
             f"NO_PROXY={_NO_PROXY_LIST}",
         ]
+    new_content = "\n".join(lines) + ("\n" if lines else "")
     try:
         tmp = env_file.with_suffix(".tmp")
-        tmp.write_text("\n".join(lines) + ("\n" if lines else ""))
+        tmp.write_text(new_content)
         os.replace(tmp, env_file)
         return True
     except OSError:
-        return False
+        pass
+    # Fall back to sudo tee for non-root users
+    r = subprocess.run(
+        ["sudo", "tee", str(env_file)],
+        input=new_content, capture_output=True, text=True,
+    )
+    return r.returncode == 0
 
 
 def set_sysproxy(enable: bool) -> None:
