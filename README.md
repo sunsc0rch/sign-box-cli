@@ -8,6 +8,9 @@ CLI-обёртка над [sing-box](https://github.com/SagerNet/sing-box) дл�
 - Библиотека прокси с фильтрацией по протоколу и стране
 - Переключение активного прокси одной командой
 - Режим SOCKS5/HTTP (порты 7890/7891/7892), TUN (прозрачный прокси) и System Proxy (GNOME + `/etc/environment`)
+- Bypass-роутинг: внутренний трафик напрямую, зарубежный через прокси (geoip + geosite rule-sets)
+- Настраиваемый DNS-сервер (plain, DoT, DoH)
+- Clash API для подключения веб-дашбордов (Yacd, Metacubex)
 - Тест задержки (TCP) и end-to-end проверка через прокси
 - Единый Python-файл — деплой через `scp`
 
@@ -54,10 +57,20 @@ proxyctl show 3                   # полные параметры прокси
 ### Активация
 
 ```bash
-proxyctl use 5                    # переключиться на прокси #5 (system proxy включается автоматически)
-proxyctl use 5 --mode tun         # то же, но в TUN-режиме
-proxyctl status                   # активный прокси + статус службы
+proxyctl use 5                         # переключиться на прокси #5 (system proxy включается автоматически)
+proxyctl use 5 --mode tun              # то же, но в TUN-режиме
+proxyctl use 5 --bypass ru             # bypass: трафик в RU напрямую, остальное через прокси
+proxyctl use 5 --bypass ru,cn          # несколько стран
+proxyctl use 5 --bypass off            # выключить bypass
+proxyctl use 5 --dns 8.8.8.8          # свой DNS-сервер
+proxyctl use 5 --dns tls://1.1.1.1    # DNS over TLS
+proxyctl use 5 --dns off               # вернуть DNS по умолчанию
+proxyctl use 5 --clash-api on         # включить Clash API на :9090
+proxyctl use 5 --clash-api off        # выключить
+proxyctl status                        # активный прокси + все настройки
 ```
+
+Флаги `--bypass`, `--dns`, `--clash-api` **сохраняются в state** — при следующем `proxyctl use <id>` они наследуются автоматически.
 
 ### Тестирование
 
@@ -67,6 +80,36 @@ proxyctl test-all                 # таблица задержек для вс�
 proxyctl test-all --timeout 3     # с кастомным таймаутом
 proxyctl test-active              # HTTP-запрос через активный прокси
 ```
+
+### Bypass-роутинг
+
+Маршрутизирует трафик по стране: внутренний — напрямую, зарубежный — через прокси. Использует бинарные rule-sets от SagerNet (geoip + geosite), которые sing-box скачивает и обновляет автоматически раз в сутки.
+
+```bash
+proxyctl use 5 --bypass ru        # RU-трафик напрямую
+proxyctl use 5 --bypass ru,cn     # RU и CN напрямую
+proxyctl use 5 --bypass off       # весь трафик через прокси
+```
+
+### DNS
+
+```bash
+proxyctl use 5 --dns 8.8.8.8          # Google DNS
+proxyctl use 5 --dns tls://1.1.1.1    # Cloudflare DoT
+proxyctl use 5 --dns https://dns.google/dns-query  # DoH
+proxyctl use 5 --dns off               # DNS по умолчанию (системный)
+```
+
+### Clash API
+
+Включает REST API, совместимый с Clash-клиентами. Позволяет подключить веб-дашборд для мониторинга трафика и управления прокси в реальном времени.
+
+```bash
+proxyctl use 5 --clash-api on    # включить API на 127.0.0.1:9090
+proxyctl use 5 --clash-api off   # выключить
+```
+
+Дашборды: [Yacd](https://yacd.haishan.me/?hostname=127.0.0.1&port=9090), [Metacubex](https://metacubex.github.io/metacubex/?hostname=127.0.0.1&port=9090)
 
 ### System Proxy
 
@@ -151,4 +194,4 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-93 теста покрывают парсеры URI, библиотеку прокси, генератор конфигов, CLI-команды и system proxy.
+100 тестов покрывают парсеры URI, библиотеку прокси, генератор конфигов (bypass/DNS/Clash API), CLI-команды и system proxy.
