@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -956,9 +957,220 @@ def cmd_install(args):
     print("Run: proxyctl add <file.txt> to load proxies.")
 
 
+# ── TUI ──────────────────────────────────────────────────────────────────────
+
+def _wcswidth(s: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in s)
+
+
+def _wcstrunc(s: str, max_w: int) -> str:
+    w, out = 0, []
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
+        if w + cw > max_w:
+            break
+        out.append(c)
+        w += cw
+    return ''.join(out)
+
+
+def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg):
+    import curses
+    try:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        active_id = state.get("active_id")
+
+        try:
+            r = subprocess.run(["systemctl", "is-active", "sing-box"],
+                               capture_output=True, text=True, timeout=1)
+            svc = r.stdout.strip()
+        except Exception:
+            svc = "?"
+
+        header = (f" proxyctl  |  sing-box: {svc}  |  mode: {state.get('mode','socks')}"
+                  f"  |  {len(proxies)} proxies")
+        stdscr.addstr(0, 0, _wcstrunc(header, w - 1), curses.A_BOLD)
+        stdscr.addstr(1, 0, "─" * (w - 1))
+
+        list_h = h - 4
+        id_w, proto_w, country_w, lat_w, host_w = 5, 8, 4, 6, 23
+        tag_w = max(8, w - id_w - proto_w - country_w - lat_w - host_w - 12)
+
+        for i, (pid, entry) in enumerate(proxies[scroll_off:scroll_off + list_h]):
+            row = 2 + i
+            is_active = pid == active_id
+            is_sel = (scroll_off + i) == selected
+
+            mark = "●" if is_active else " "
+            sel_mark = "▶" if is_sel else " "
+            proto = (entry.get("protocol") or "?")[:proto_w]
+            country = (entry.get("country") or "--")[:country_w]
+            tag = _wcstrunc(entry.get("tag", ""), tag_w)
+            host = f"{entry.get('host','')}:{entry.get('port','')}".ljust(host_w)[:host_w]
+            lat = latencies.get(pid)
+            lat_str = (f"{lat:.0f}ms" if lat is not None else "---").rjust(lat_w)
+
+            line = (f"{sel_mark}{mark} {pid:>{id_w}}  {proto:<{proto_w}} {country:<{country_w}}  "
+                    f"{tag:<{tag_w}}  {host} {lat_str}")
+            line = _wcstrunc(line, w - 1).ljust(w - 1)
+
+            attr = curses.A_REVERSE if is_sel else curses.A_NORMAL
+            if is_active and curses.has_colors():
+                attr |= curses.color_pair(1)
+            try:
+                stdscr.addstr(row, 0, line, attr)
+            except curses.error:
+                pass
+
+        stdscr.addstr(h - 2, 0, "─" * (w - 1))
+        footer = (status_msg if status_msg
+                  else " ↑↓/jk: navigate   U/Enter: use   T: test   D: delete   Q: quit")
+        try:
+            stdscr.addstr(h - 1, 0, _wcstrunc(footer, w - 1))
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+    except curses.error:
+        pass
+
+
+def _tui_suspend(stdscr, fn, *args, **kwargs):
+    """Leave curses, run fn(), show output, wait for Enter, return to curses."""
+    import curses
+    curses.endwin()
+    print()
+    try:
+        fn(*args, **kwargs)
+    except SystemExit:
+        pass
+    except Exception as e:
+        print(f"Error: {e}")
+    try:
+        input("\nPress Enter to return to menu...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    stdscr.refresh()
+
+
+def _tui_main(stdscr):
+    import curses
+    curses.curs_set(0)
+    curses.noecho()
+    stdscr.keypad(True)
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+
+    state = load_state()
+    proxies = ProxyLibrary(PROXIES_FILE).load().all()
+    latencies: dict = {}
+    status_msg = ""
+    selected = 0
+
+    active_id = state.get("active_id")
+    for i, (pid, _) in enumerate(proxies):
+        if pid == active_id:
+            selected = i
+            break
+
+    scroll_off = 0
+
+    while True:
+        h, _ = stdscr.getmaxyx()
+        list_h = h - 4
+
+        if selected < scroll_off:
+            scroll_off = selected
+        elif selected >= scroll_off + list_h:
+            scroll_off = selected - list_h + 1
+
+        _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg)
+        status_msg = ""
+
+        key = stdscr.getch()
+
+        if not proxies:
+            if key in (ord('q'), ord('Q'), 27):
+                break
+            continue
+
+        if key in (curses.KEY_UP, ord('k'), ord('K')):
+            selected = max(0, selected - 1)
+
+        elif key in (curses.KEY_DOWN, ord('j'), ord('J')):
+            selected = min(len(proxies) - 1, selected + 1)
+
+        elif key == curses.KEY_PPAGE:
+            selected = max(0, selected - list_h)
+
+        elif key == curses.KEY_NPAGE:
+            selected = min(len(proxies) - 1, selected + list_h)
+
+        elif key in (ord('u'), ord('U'), 10, 13):
+            pid, entry = proxies[selected]
+            ns = argparse.Namespace(
+                id=pid, mode=state.get("mode", "socks"),
+                bypass=None, dns=None, clash_api=None,
+            )
+            _tui_suspend(stdscr, cmd_use, ns)
+            state = load_state()
+            proxies = ProxyLibrary(PROXIES_FILE).load().all()
+            status_msg = f" ● Active: [{pid}] {_wcstrunc(entry.get('tag',''), 40)}"
+
+        elif key in (ord('t'), ord('T')):
+            pid, entry = proxies[selected]
+            status_msg = f" Testing [{pid}]..."
+            _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg)
+            lat = tcp_test(entry.get("host", ""), entry.get("port", 0), timeout=5.0)
+            latencies[pid] = lat
+            status_msg = f" [{pid}] {'%dms' % lat if lat is not None else 'FAIL'}"
+
+        elif key in (ord('d'), ord('D')):
+            pid, entry = proxies[selected]
+            h2, w2 = stdscr.getmaxyx()
+            msg = f" Delete [{pid}]? Press D to confirm, any other key to cancel"
+            try:
+                stdscr.addstr(h2 - 1, 0, _wcstrunc(msg, w2 - 1), curses.A_REVERSE)
+            except curses.error:
+                pass
+            stdscr.refresh()
+            c2 = stdscr.getch()
+            if c2 in (ord('d'), ord('D')):
+                lib = ProxyLibrary(PROXIES_FILE).load()
+                lib.remove(pid)
+                lib.save()
+                if state.get("active_id") == pid:
+                    service_action("stop")
+                    state = load_state()
+                latencies.pop(pid, None)
+                proxies = lib.all()
+                selected = min(selected, max(0, len(proxies) - 1))
+                status_msg = f" Deleted [{pid}]"
+            else:
+                status_msg = " Cancelled"
+
+        elif key in (ord('q'), ord('Q'), 27):
+            break
+
+
+def cmd_tui():
+    import curses
+    try:
+        curses.wrapper(_tui_main)
+    except KeyboardInterrupt:
+        pass
+
+
 # ── Entry Point ──────────────────────────────────────────────────────────────
 
 def main():
+    if len(sys.argv) == 1:
+        cmd_tui()
+        return
+
     parser = argparse.ArgumentParser(prog="proxyctl", description="Manage sing-box proxies")
     sub = parser.add_subparsers(dest="command", required=True)
 
