@@ -334,7 +334,13 @@ def save_state(state: dict):
 
 # ── Config Generator ─────────────────────────────────────────────────────────
 
-def generate_active_config(outbound: dict, mode: str = "socks") -> dict:
+def generate_active_config(
+    outbound: dict,
+    mode: str = "socks",
+    bypass: Optional[list] = None,
+    dns: Optional[str] = None,
+    clash_api: bool = False,
+) -> dict:
     inbounds = [
         {"type": "http",  "tag": "http-in",  "listen": "::", "listen_port": 7890},
         {"type": "socks", "tag": "socks-in", "listen": "::", "listen_port": 7891},
@@ -350,7 +356,36 @@ def generate_active_config(outbound: dict, mode: str = "socks") -> dict:
             "sniff": True,
         })
 
-    return {
+    route: dict = {"final": outbound["tag"]}
+    if bypass:
+        route_rules = [{"ip_is_private": True, "outbound": "direct"}]
+        rule_sets = []
+        for country in bypass:
+            country = country.lower()
+            route_rules.append({
+                "rule_set": [f"geoip-{country}", f"geosite-{country}"],
+                "outbound": "direct",
+            })
+            rule_sets += [
+                {
+                    "type": "remote",
+                    "tag": f"geoip-{country}",
+                    "format": "binary",
+                    "url": f"https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip-{country}.srs",
+                    "update_interval": "1d",
+                },
+                {
+                    "type": "remote",
+                    "tag": f"geosite-{country}",
+                    "format": "binary",
+                    "url": f"https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite-{country}.srs",
+                    "update_interval": "1d",
+                },
+            ]
+        route["rules"] = route_rules
+        route["rule_set"] = rule_sets
+
+    config: dict = {
         "log": {"level": "warn"},
         "inbounds": inbounds,
         "outbounds": [
@@ -358,8 +393,24 @@ def generate_active_config(outbound: dict, mode: str = "socks") -> dict:
             {"type": "direct", "tag": "direct"},
             {"type": "block",  "tag": "block"},
         ],
-        "route": {"final": outbound["tag"]},
+        "route": route,
     }
+
+    if dns:
+        config["dns"] = {
+            "servers": [{"tag": "dns-main", "address": dns}],
+            "final": "dns-main",
+        }
+
+    if clash_api:
+        config["experimental"] = {
+            "clash_api": {
+                "external_controller": "127.0.0.1:9090",
+                "secret": "",
+            }
+        }
+
+    return config
 
 
 # ── Service Management ───────────────────────────────────────────────────────
@@ -590,19 +641,58 @@ def cmd_sysproxy(args):
             print(f"  /etc/environment: {'proxy vars set' if has_proxy else 'no proxy vars'}")
 
 
+def _resolve_use_settings(args, state: dict) -> tuple:
+    """Resolve bypass/dns/clash_api from CLI args, falling back to existing state."""
+    raw_bypass = getattr(args, "bypass", None)
+    if raw_bypass is None:
+        bypass = state.get("bypass") or []
+    elif raw_bypass.lower() == "off":
+        bypass = []
+    else:
+        bypass = [c.strip().lower() for c in raw_bypass.split(",") if c.strip()]
+
+    raw_dns = getattr(args, "dns", None)
+    if raw_dns is None:
+        dns = state.get("dns")
+    elif raw_dns.lower() == "off":
+        dns = None
+    else:
+        dns = raw_dns
+
+    raw_clash = getattr(args, "clash_api", None)
+    if raw_clash is None:
+        clash_api = state.get("clash_api", False)
+    else:
+        clash_api = raw_clash == "on"
+
+    return bypass, dns, clash_api
+
+
 def cmd_use(args):
+    state = load_state()
     lib = ProxyLibrary(PROXIES_FILE).load()
     proxy = lib.get(args.id)
     if not proxy:
         print(f"Error: proxy {args.id} not found.", file=sys.stderr)
         sys.exit(1)
 
-    config = generate_active_config(proxy["outbound"], mode=args.mode)
+    bypass, dns, clash_api = _resolve_use_settings(args, state)
+
+    config = generate_active_config(proxy["outbound"], mode=args.mode,
+                                    bypass=bypass, dns=dns, clash_api=clash_api)
     SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     tmp = SING_BOX_CONFIG.with_suffix(".tmp")
     tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False))
     os.replace(tmp, SING_BOX_CONFIG)
-    save_state({"active_id": args.id, "mode": args.mode})
+
+    state.update({
+        "active_id": args.id,
+        "mode": args.mode,
+        "bypass": bypass,
+        "dns": dns,
+        "clash_api": clash_api,
+    })
+    save_state(state)
 
     service_action("restart")
     deadline = time.time() + 5
@@ -623,10 +713,18 @@ def cmd_use(args):
         subprocess.run(["journalctl", "-u", "sing-box", "-n", "10", "--no-pager"])
         sys.exit(1)
 
-    print(
-        f"Active: [{args.id}] {proxy['tag']} | {proxy['protocol']} "
-        f"| {proxy['host']}:{proxy['port']} | mode={args.mode}"
-    )
+    summary_parts = [
+        f"Active: [{args.id}] {proxy['tag']}",
+        f"{proxy['protocol']} | {proxy['host']}:{proxy['port']}",
+        f"mode={args.mode}",
+    ]
+    if bypass:
+        summary_parts.append(f"bypass={','.join(bypass)}")
+    if dns:
+        summary_parts.append(f"dns={dns}")
+    if clash_api:
+        summary_parts.append("clash-api=:9090")
+    print(" | ".join(summary_parts))
     print("Setting system proxy...")
     set_sysproxy(True)
 
@@ -655,10 +753,17 @@ def cmd_status(args):
     )
     svc_status = result.stdout.strip()
 
+    bypass = state.get("bypass") or []
+    dns = state.get("dns")
+    clash_api = state.get("clash_api", False)
+
     print(f"Active proxy: [{active_id}] {proxy['tag']}")
     print(f"Protocol:     {proxy['protocol']}")
     print(f"Host:         {proxy['host']}:{proxy['port']}")
     print(f"Mode:         {state.get('mode', 'socks')}")
+    print(f"Bypass:       {','.join(bypass) if bypass else 'off'}")
+    print(f"DNS:          {dns if dns else 'default'}")
+    print(f"Clash API:    {'on (:9090)' if clash_api else 'off'}")
     print(f"sing-box:     {svc_status}")
     print(f"System proxy: {'on' if state.get('sysproxy') else 'off'}")
     print(f"HTTP proxy:   http://127.0.0.1:7890")
@@ -774,12 +879,19 @@ def cmd_tun(args):
         sys.exit(1)
 
     new_mode = "tun" if args.action == "on" else "socks"
-    config = generate_active_config(proxy["outbound"], mode=new_mode)
+    config = generate_active_config(
+        proxy["outbound"],
+        mode=new_mode,
+        bypass=state.get("bypass") or [],
+        dns=state.get("dns"),
+        clash_api=state.get("clash_api", False),
+    )
     SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     tmp = SING_BOX_CONFIG.with_suffix(".tmp")
     tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False))
     os.replace(tmp, SING_BOX_CONFIG)
-    save_state({"active_id": state["active_id"], "mode": new_mode})
+    state["mode"] = new_mode
+    save_state(state)
     service_action("restart")
     print(f"TUN mode {'enabled' if args.action == 'on' else 'disabled'}.")
 
@@ -853,7 +965,7 @@ def main():
     p = sub.add_parser("add");      p.add_argument("source")
     p = sub.add_parser("list");     p.add_argument("--protocol"); p.add_argument("--country")
     p = sub.add_parser("show");     p.add_argument("id", type=int)
-    p = sub.add_parser("use");      p.add_argument("id", type=int); p.add_argument("--mode", choices=["socks","tun"], default="socks")
+    p = sub.add_parser("use");      p.add_argument("id", type=int); p.add_argument("--mode", choices=["socks","tun"], default="socks"); p.add_argument("--bypass", default=None, metavar="CC", help="Country codes to route direct, comma-separated (e.g. ru,cn). 'off' to disable"); p.add_argument("--dns", default=None, help="DNS server address (e.g. 8.8.8.8 or tls://1.1.1.1). 'off' to disable"); p.add_argument("--clash-api", dest="clash_api", choices=["on","off"], default=None, help="Enable Clash API on :9090")
     sub.add_parser("status")
     p = sub.add_parser("test");     p.add_argument("id", type=int); p.add_argument("--timeout", type=float, default=5.0)
     p = sub.add_parser("test-all"); p.add_argument("--timeout", type=float, default=5.0)

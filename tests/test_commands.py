@@ -176,7 +176,7 @@ def test_use_writes_config_and_restarts(tmp_library, monkeypatch, tmp_path):
          patch("proxyctl.set_sysproxy"), \
          patch("time.sleep"):
         mock_run.return_value = MagicMock(stdout="active\n", returncode=0)
-        proxyctl.cmd_use(_make_args(id=1, mode="socks"))
+        proxyctl.cmd_use(_make_args(id=1, mode="socks", bypass=None, dns=None, clash_api=None))
 
     assert config_path.exists()
     cfg = json.loads(config_path.read_text())
@@ -194,7 +194,7 @@ def test_use_tun_mode_config(tmp_library, monkeypatch, tmp_path):
          patch("proxyctl.set_sysproxy"), \
          patch("time.sleep"):
         mock_run.return_value = MagicMock(stdout="active\n", returncode=0)
-        proxyctl.cmd_use(_make_args(id=1, mode="tun"))
+        proxyctl.cmd_use(_make_args(id=1, mode="tun", bypass=None, dns=None, clash_api=None))
 
     cfg = json.loads(config_path.read_text())
     inbound_types = [i["type"] for i in cfg["inbounds"]]
@@ -204,7 +204,7 @@ def test_use_tun_mode_config(tmp_library, monkeypatch, tmp_path):
 def test_use_nonexistent_id_exits(tmp_library, monkeypatch):
     monkeypatch.setattr(proxyctl, "PROXIES_FILE", tmp_library)
     with pytest.raises(SystemExit):
-        proxyctl.cmd_use(_make_args(id=999, mode="socks"))
+        proxyctl.cmd_use(_make_args(id=999, mode="socks", bypass=None, dns=None, clash_api=None))
 
 
 def test_use_prints_log_on_start_failure(tmp_library, monkeypatch, tmp_path):
@@ -217,7 +217,7 @@ def test_use_prints_log_on_start_failure(tmp_library, monkeypatch, tmp_path):
          patch("time.sleep"):
         mock_run.return_value = MagicMock(stdout="failed\n", returncode=1)
         with pytest.raises(SystemExit):
-            proxyctl.cmd_use(_make_args(id=1, mode="socks"))
+            proxyctl.cmd_use(_make_args(id=1, mode="socks", bypass=None, dns=None, clash_api=None))
 
 
 def test_status_no_active(tmp_library, monkeypatch, capsys):
@@ -433,5 +433,5 @@ def test_use_enables_sysproxy(tmp_library, monkeypatch, tmp_path):
          patch("proxyctl._set_env_proxy", return_value=True), \
          patch("time.sleep"):
         mock_run.return_value = MagicMock(stdout="active\n", returncode=0)
-        proxyctl.cmd_use(_make_args(id=1, mode="socks"))
+        proxyctl.cmd_use(_make_args(id=1, mode="socks", bypass=None, dns=None, clash_api=None))
     mock_gnome.assert_called_once_with(True)

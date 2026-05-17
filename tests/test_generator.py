@@ -75,3 +75,63 @@ def test_hysteria2_config_structure():
     cfg = generate_active_config(out)
     proxy_out = next(o for o in cfg["outbounds"] if o["type"] == "hysteria2")
     assert proxy_out["password"] == "mypassword"
+
+
+def test_bypass_adds_route_rules_and_rule_sets():
+    out = parse_uri(VLESS_REALITY)
+    cfg = generate_active_config(out, bypass=["ru"])
+    assert "rules" in cfg["route"]
+    assert "rule_set" in cfg["route"]
+    rule_set_tags = [rs["tag"] for rs in cfg["route"]["rule_set"]]
+    assert "geoip-ru" in rule_set_tags
+    assert "geosite-ru" in rule_set_tags
+    # Private IP rule is first
+    assert cfg["route"]["rules"][0] == {"ip_is_private": True, "outbound": "direct"}
+    # RU bypass rule is second
+    ru_rule = cfg["route"]["rules"][1]
+    assert ru_rule["outbound"] == "direct"
+    assert "geoip-ru" in ru_rule["rule_set"]
+    assert "geosite-ru" in ru_rule["rule_set"]
+
+
+def test_bypass_multi_country():
+    out = parse_uri(VLESS_REALITY)
+    cfg = generate_active_config(out, bypass=["ru", "cn"])
+    rule_set_tags = [rs["tag"] for rs in cfg["route"]["rule_set"]]
+    assert "geoip-ru" in rule_set_tags
+    assert "geoip-cn" in rule_set_tags
+    assert len(cfg["route"]["rules"]) == 3  # private + ru + cn
+
+
+def test_no_bypass_no_route_rules():
+    out = parse_uri(VLESS_REALITY)
+    cfg = generate_active_config(out)
+    assert "rules" not in cfg["route"]
+    assert "rule_set" not in cfg["route"]
+
+
+def test_dns_adds_dns_section():
+    out = parse_uri(VLESS_REALITY)
+    cfg = generate_active_config(out, dns="8.8.8.8")
+    assert "dns" in cfg
+    assert cfg["dns"]["servers"][0]["address"] == "8.8.8.8"
+    assert cfg["dns"]["final"] == "dns-main"
+
+
+def test_no_dns_no_dns_section():
+    out = parse_uri(VLESS_REALITY)
+    cfg = generate_active_config(out)
+    assert "dns" not in cfg
+
+
+def test_clash_api_adds_experimental():
+    out = parse_uri(VLESS_REALITY)
+    cfg = generate_active_config(out, clash_api=True)
+    assert "experimental" in cfg
+    assert cfg["experimental"]["clash_api"]["external_controller"] == "127.0.0.1:9090"
+
+
+def test_no_clash_api_no_experimental():
+    out = parse_uri(VLESS_REALITY)
+    cfg = generate_active_config(out)
+    assert "experimental" not in cfg
