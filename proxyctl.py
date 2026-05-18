@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import urllib.parse
@@ -1036,11 +1037,23 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
             tag = _wcstrunc(entry.get("tag", ""), tag_w)
             host = f"{entry.get('host','')}:{entry.get('port','')}".ljust(host_w)[:host_w]
             lat = latencies.get(pid)
-            lat_str = (f"{lat:.0f}ms" if lat is not None else "---").rjust(lat_w)
+            if isinstance(lat, str):       # testing in progress: "…2s"
+                lat_str = lat.rjust(lat_w)
+                lat_color = 0
+            elif lat is False:             # tested, unreachable
+                lat_str = "FAIL".rjust(lat_w)
+                lat_color = 3
+            elif lat is not None:          # tested, reachable
+                lat_str = f"{lat:.0f}ms".rjust(lat_w)
+                lat_color = 0
+            else:                          # not tested yet
+                lat_str = "---".rjust(lat_w)
+                lat_color = 0
 
-            line = (f"{cursor}{check}{active} {pid:>{id_w}}  {proto:<{proto_w}} {country:<{country_w}}  "
-                    f"{tag:<{tag_w}}  {host} {lat_str}")
-            line = _wcstrunc(line, w - 1).ljust(w - 1)
+            prefix = _wcstrunc(
+                f"{cursor}{check}{active} {pid:>{id_w}}  {proto:<{proto_w}} {country:<{country_w}}  "
+                f"{tag:<{tag_w}}  {host} ", w - lat_w - 1)
+            line = (prefix + lat_str)[:w - 1].ljust(w - 1)
 
             attr = curses.A_REVERSE if is_sel else curses.A_NORMAL
             if is_marked and curses.has_colors():
@@ -1049,6 +1062,9 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
                 attr |= curses.color_pair(1)
             try:
                 stdscr.addstr(row, 0, line, attr)
+                if lat_color and curses.has_colors() and not is_sel:
+                    col = max(0, min(w - lat_w - 1, len(prefix)))
+                    stdscr.addstr(row, col, lat_str, curses.color_pair(lat_color))
             except curses.error:
                 pass
 
@@ -1096,6 +1112,7 @@ def _tui_main(stdscr):
         curses.start_color()
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(3, curses.COLOR_RED, -1)
 
     state = load_state()
     proxies = ProxyLibrary(PROXIES_FILE).load().all()
@@ -1174,11 +1191,30 @@ def _tui_main(stdscr):
 
         elif key in (ord('t'), ord('T')):
             pid, entry = proxies[selected]
-            status_msg = f" Testing [{pid}]..."
-            _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids)
-            lat = tcp_test(entry.get("host", ""), entry.get("port", 0), timeout=5.0)
-            latencies[pid] = lat
-            status_msg = f" [{pid}] {'%dms' % lat if lat is not None else 'FAIL'}"
+            host, port = entry.get("host", ""), entry.get("port", 0)
+
+            result: list = [None]
+            done = threading.Event()
+
+            def _run_test():
+                result[0] = tcp_test(host, port, timeout=5.0)
+                done.set()
+
+            threading.Thread(target=_run_test, daemon=True).start()
+
+            t_start = time.time()
+            stdscr.timeout(200)
+            while not done.is_set():
+                elapsed = time.time() - t_start
+                latencies[pid] = f"…{elapsed:.0f}s"
+                _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies,
+                          f" Testing [{pid}]...", marked_ids)
+                stdscr.getch()
+            stdscr.timeout(-1)
+
+            lat = result[0]
+            latencies[pid] = lat if lat is not None else False
+            status_msg = f" [{pid}] {'%.0fms' % lat if lat is not None else 'FAIL — unreachable'}"
 
         elif key in (ord('d'), ord('D')):
             to_delete = list(marked_ids) if marked_ids else [proxies[selected][0]]
