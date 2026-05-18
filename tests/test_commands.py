@@ -4,7 +4,7 @@ from unittest.mock import patch, MagicMock
 from pathlib import Path
 from conftest import VLESS_REALITY, SS_B64, TROJAN, HYSTERIA2
 import proxyctl
-from proxyctl import ProxyLibrary, load_state, save_state, parse_uri, build_library_entry
+from proxyctl import ProxyLibrary, load_state, save_state, parse_uri, build_library_entry, _parse_id_args
 
 
 @pytest.fixture
@@ -335,6 +335,47 @@ def test_tun_no_active_exits(tmp_library, monkeypatch):
     monkeypatch.setattr(proxyctl, "PROXIES_FILE", tmp_library)
     with pytest.raises(SystemExit):
         proxyctl.cmd_tun(_make_args(action="on"))
+
+
+# ── _parse_id_args ───────────────────────────────────────────────────────────
+
+def test_parse_id_args_plain():
+    assert _parse_id_args(["1", "3", "5"]) == [1, 3, 5]
+
+def test_parse_id_args_range():
+    assert _parse_id_args(["1-5"]) == [1, 2, 3, 4, 5]
+
+def test_parse_id_args_mixed():
+    assert _parse_id_args(["1", "3-5", "8"]) == [1, 3, 4, 5, 8]
+
+def test_parse_id_args_single_range():
+    assert _parse_id_args(["7-7"]) == [7]
+
+def test_parse_id_args_invalid():
+    with pytest.raises(ValueError):
+        _parse_id_args(["abc"])
+
+def test_parse_id_args_invalid_range():
+    with pytest.raises(ValueError):
+        _parse_id_args(["1-x"])
+
+
+def test_cmd_remove_range(tmp_library, monkeypatch, capsys):
+    _populated_lib(tmp_library, monkeypatch)
+    # Add a second and third proxy
+    lib = ProxyLibrary(tmp_library).load()
+    from conftest import VLESS_REALITY
+    from proxyctl import parse_uri, build_library_entry
+    for _ in range(3):
+        entry = build_library_entry(VLESS_REALITY, parse_uri(VLESS_REALITY))
+        lib.add(entry)
+    lib.save()
+
+    with patch("proxyctl.service_action"):
+        proxyctl.cmd_remove(_make_args(ids=["1-3"], all=False, protocol=None, country=None))
+
+    out = capsys.readouterr().out
+    assert "Removed 3" in out
 
 
 # ── sysproxy ─────────────────────────────────────────────────────────────────

@@ -836,6 +836,26 @@ def cmd_test_active(args):
         sys.exit(1)
 
 
+def _parse_id_args(raw_ids: list) -> list:
+    """Parse id arguments supporting ranges like '1-5' → [1,2,3,4,5]."""
+    result = []
+    for arg in raw_ids:
+        s = str(arg)
+        if "-" in s:
+            parts = s.split("-", 1)
+            try:
+                lo, hi = int(parts[0]), int(parts[1])
+            except ValueError:
+                raise ValueError(f"Invalid id or range: {arg!r}")
+            result.extend(range(lo, hi + 1))
+        else:
+            try:
+                result.append(int(s))
+            except ValueError:
+                raise ValueError(f"Invalid id: {arg!r}")
+    return result
+
+
 def cmd_remove(args):
     lib = ProxyLibrary(PROXIES_FILE).load()
     state = load_state()
@@ -850,7 +870,11 @@ def cmd_remove(args):
     elif getattr(args, "country", None):
         to_remove = [id_ for id_, v in lib.all() if v["country"] == args.country.upper()]
     else:
-        to_remove = list(args.ids)
+        try:
+            to_remove = _parse_id_args(args.ids)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     removed = 0
     for id_ in to_remove:
@@ -974,7 +998,7 @@ def _wcstrunc(s: str, max_w: int) -> str:
     return ''.join(out)
 
 
-def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg):
+def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids):
     import curses
     try:
         stdscr.erase()
@@ -988,22 +1012,25 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
         except Exception:
             svc = "?"
 
+        mark_info = f"  |  {len(marked_ids)} marked" if marked_ids else ""
         header = (f" proxyctl  |  sing-box: {svc}  |  mode: {state.get('mode','socks')}"
-                  f"  |  {len(proxies)} proxies")
+                  f"  |  {len(proxies)} proxies{mark_info}")
         stdscr.addstr(0, 0, _wcstrunc(header, w - 1), curses.A_BOLD)
         stdscr.addstr(1, 0, "─" * (w - 1))
 
         list_h = h - 4
         id_w, proto_w, country_w, lat_w, host_w = 5, 8, 4, 6, 23
-        tag_w = max(8, w - id_w - proto_w - country_w - lat_w - host_w - 12)
+        tag_w = max(8, w - id_w - proto_w - country_w - lat_w - host_w - 13)
 
         for i, (pid, entry) in enumerate(proxies[scroll_off:scroll_off + list_h]):
             row = 2 + i
             is_active = pid == active_id
             is_sel = (scroll_off + i) == selected
+            is_marked = pid in marked_ids
 
-            mark = "●" if is_active else " "
-            sel_mark = "▶" if is_sel else " "
+            cursor = "▶" if is_sel else " "
+            check  = "*" if is_marked else " "
+            active = "●" if is_active else " "
             proto = (entry.get("protocol") or "?")[:proto_w]
             country = (entry.get("country") or "--")[:country_w]
             tag = _wcstrunc(entry.get("tag", ""), tag_w)
@@ -1011,12 +1038,14 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
             lat = latencies.get(pid)
             lat_str = (f"{lat:.0f}ms" if lat is not None else "---").rjust(lat_w)
 
-            line = (f"{sel_mark}{mark} {pid:>{id_w}}  {proto:<{proto_w}} {country:<{country_w}}  "
+            line = (f"{cursor}{check}{active} {pid:>{id_w}}  {proto:<{proto_w}} {country:<{country_w}}  "
                     f"{tag:<{tag_w}}  {host} {lat_str}")
             line = _wcstrunc(line, w - 1).ljust(w - 1)
 
             attr = curses.A_REVERSE if is_sel else curses.A_NORMAL
-            if is_active and curses.has_colors():
+            if is_marked and curses.has_colors():
+                attr |= curses.color_pair(2)
+            elif is_active and curses.has_colors():
                 attr |= curses.color_pair(1)
             try:
                 stdscr.addstr(row, 0, line, attr)
@@ -1024,8 +1053,12 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
                 pass
 
         stdscr.addstr(h - 2, 0, "─" * (w - 1))
-        footer = (status_msg if status_msg
-                  else " ↑↓/jk: navigate   U/Enter: use   T: test   D: delete   Q: quit")
+        if status_msg:
+            footer = status_msg
+        elif marked_ids:
+            footer = f" [{len(marked_ids)} marked]  Space: toggle  D: delete marked  Esc: clear  Q: quit"
+        else:
+            footer = " ↑↓/jk: navigate   Space: mark   U/Enter: use   T: test   D: delete   Q: quit"
         try:
             stdscr.addstr(h - 1, 0, _wcstrunc(footer, w - 1))
         except curses.error:
@@ -1067,6 +1100,7 @@ def _tui_main(stdscr):
     state = load_state()
     proxies = ProxyLibrary(PROXIES_FILE).load().all()
     latencies: dict = {}
+    marked_ids: set = set()
     status_msg = ""
     selected = 0
 
@@ -1077,6 +1111,8 @@ def _tui_main(stdscr):
             break
 
     scroll_off = 0
+    if curses.has_colors():
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
 
     while True:
         h, _ = stdscr.getmaxyx()
@@ -1087,7 +1123,7 @@ def _tui_main(stdscr):
         elif selected >= scroll_off + list_h:
             scroll_off = selected - list_h + 1
 
-        _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg)
+        _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids)
         status_msg = ""
 
         key = stdscr.getch()
@@ -1109,6 +1145,22 @@ def _tui_main(stdscr):
         elif key == curses.KEY_NPAGE:
             selected = min(len(proxies) - 1, selected + list_h)
 
+        elif key == ord(' '):
+            pid, _ = proxies[selected]
+            if pid in marked_ids:
+                marked_ids.discard(pid)
+            else:
+                marked_ids.add(pid)
+            # auto-advance cursor
+            selected = min(len(proxies) - 1, selected + 1)
+
+        elif key == 27:  # Esc — clear marks or quit
+            if marked_ids:
+                marked_ids.clear()
+                status_msg = " Selection cleared"
+            else:
+                break
+
         elif key in (ord('u'), ord('U'), 10, 13):
             pid, entry = proxies[selected]
             ns = argparse.Namespace(
@@ -1123,15 +1175,19 @@ def _tui_main(stdscr):
         elif key in (ord('t'), ord('T')):
             pid, entry = proxies[selected]
             status_msg = f" Testing [{pid}]..."
-            _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg)
+            _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids)
             lat = tcp_test(entry.get("host", ""), entry.get("port", 0), timeout=5.0)
             latencies[pid] = lat
             status_msg = f" [{pid}] {'%dms' % lat if lat is not None else 'FAIL'}"
 
         elif key in (ord('d'), ord('D')):
-            pid, entry = proxies[selected]
+            to_delete = list(marked_ids) if marked_ids else [proxies[selected][0]]
+            n = len(to_delete)
             h2, w2 = stdscr.getmaxyx()
-            msg = f" Delete [{pid}]? Press D to confirm, any other key to cancel"
+            if n == 1:
+                msg = f" Delete [{to_delete[0]}]? Press D to confirm, any other key to cancel"
+            else:
+                msg = f" Delete {n} marked proxies? Press D to confirm, any other key to cancel"
             try:
                 stdscr.addstr(h2 - 1, 0, _wcstrunc(msg, w2 - 1), curses.A_REVERSE)
             except curses.error:
@@ -1140,19 +1196,26 @@ def _tui_main(stdscr):
             c2 = stdscr.getch()
             if c2 in (ord('d'), ord('D')):
                 lib = ProxyLibrary(PROXIES_FILE).load()
-                lib.remove(pid)
+                removed = 0
+                stopped = False
+                for pid in to_delete:
+                    if lib.remove(pid):
+                        removed += 1
+                        latencies.pop(pid, None)
+                        if state.get("active_id") == pid and not stopped:
+                            service_action("stop")
+                            stopped = True
                 lib.save()
-                if state.get("active_id") == pid:
-                    service_action("stop")
+                if stopped:
                     state = load_state()
-                latencies.pop(pid, None)
+                marked_ids.clear()
                 proxies = lib.all()
                 selected = min(selected, max(0, len(proxies) - 1))
-                status_msg = f" Deleted [{pid}]"
+                status_msg = f" Deleted {removed} proxy(ies)"
             else:
                 status_msg = " Cancelled"
 
-        elif key in (ord('q'), ord('Q'), 27):
+        elif key in (ord('q'), ord('Q')):
             break
 
 
@@ -1182,7 +1245,7 @@ def main():
     p = sub.add_parser("test");     p.add_argument("id", type=int); p.add_argument("--timeout", type=float, default=5.0)
     p = sub.add_parser("test-all"); p.add_argument("--timeout", type=float, default=5.0)
     p = sub.add_parser("test-active"); p.add_argument("--timeout", type=float, default=10.0)
-    p = sub.add_parser("remove");   p.add_argument("ids", nargs="*", type=int); p.add_argument("--all", action="store_true"); p.add_argument("--protocol"); p.add_argument("--country")
+    p = sub.add_parser("remove");   p.add_argument("ids", nargs="*"); p.add_argument("--all", action="store_true"); p.add_argument("--protocol"); p.add_argument("--country")
     sub.add_parser("start"); sub.add_parser("stop"); sub.add_parser("restart"); sub.add_parser("logs")
     p = sub.add_parser("tun");      p.add_argument("action", choices=["on","off"])
     p = sub.add_parser("sysproxy"); p.add_argument("action", choices=["on","off","status"])
