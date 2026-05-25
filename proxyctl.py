@@ -1074,7 +1074,7 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
         elif marked_ids:
             footer = f" [{len(marked_ids)} marked]  Space: toggle  D: delete marked  Esc: clear  Q: quit"
         else:
-            footer = " ↑↓/jk: navigate   Space: mark   U/Enter: use   T: test   D: delete   Q: quit"
+            footer = " ↑↓/jk: nav  Space: mark  U: use  T: test  A: test all  D: del  F: del FAIL  Q: quit"
         try:
             stdscr.addstr(h - 1, 0, _wcstrunc(footer, w - 1))
         except curses.error:
@@ -1250,6 +1250,73 @@ def _tui_main(stdscr):
                 status_msg = f" Deleted {removed} proxy(ies)"
             else:
                 status_msg = " Cancelled"
+
+        elif key in (ord('a'), ord('A')):
+            total = len(proxies)
+            done_count = [0]
+            count_lock = threading.Lock()
+            all_done = threading.Event()
+
+            for pid, _ in proxies:
+                latencies[pid] = "…"
+
+            def _test_one(pid, entry):
+                host, port = entry.get("host", ""), entry.get("port", 0)
+                r = tcp_test(host, port, timeout=5.0)
+                latencies[pid] = r if r is not None else False
+                with count_lock:
+                    done_count[0] += 1
+                    if done_count[0] == total:
+                        all_done.set()
+
+            for pid, entry in proxies:
+                threading.Thread(target=_test_one, args=(pid, entry), daemon=True).start()
+
+            stdscr.timeout(200)
+            while not all_done.is_set():
+                _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies,
+                          f" Testing all... {done_count[0]}/{total}", marked_ids)
+                stdscr.getch()
+            stdscr.timeout(-1)
+
+            fails = sum(1 for pid, _ in proxies if latencies.get(pid) is False)
+            status_msg = f" Tested {total} proxies: {fails} failed, {total - fails} ok"
+
+        elif key in (ord('f'), ord('F')):
+            fail_ids = [pid for pid, _ in proxies if latencies.get(pid) is False]
+            if not fail_ids:
+                status_msg = " No failed proxies — run A to test all first"
+            else:
+                n = len(fail_ids)
+                h2, w2 = stdscr.getmaxyx()
+                msg = f" Delete {n} FAIL proxy(ies)? Press F to confirm, any other key to cancel"
+                try:
+                    stdscr.addstr(h2 - 1, 0, _wcstrunc(msg, w2 - 1), curses.A_REVERSE)
+                except curses.error:
+                    pass
+                stdscr.refresh()
+                c2 = stdscr.getch()
+                if c2 in (ord('f'), ord('F')):
+                    lib = ProxyLibrary(PROXIES_FILE).load()
+                    removed = 0
+                    stopped = False
+                    for pid in fail_ids:
+                        if lib.remove(pid):
+                            removed += 1
+                            latencies.pop(pid, None)
+                            if state.get("active_id") == pid and not stopped:
+                                service_action("stop")
+                                stopped = True
+                    lib.save()
+                    if stopped:
+                        state = load_state()
+                    marked_ids.discard(*fail_ids) if fail_ids else None
+                    marked_ids -= set(fail_ids)
+                    proxies = lib.all()
+                    selected = min(selected, max(0, len(proxies) - 1))
+                    status_msg = f" Deleted {removed} FAIL proxy(ies)"
+                else:
+                    status_msg = " Cancelled"
 
         elif key in (ord('q'), ord('Q')):
             break
