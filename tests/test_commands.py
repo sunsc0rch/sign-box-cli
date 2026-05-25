@@ -292,11 +292,7 @@ def test_cmd_test_all_output(tmp_library, monkeypatch, capsys):
 def test_cmd_test_active_ok(tmp_library, monkeypatch, capsys):
     _populated_lib(tmp_library, monkeypatch)
     save_state({"active_id": 1, "mode": "socks"})
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"query": "1.2.3.4", "country": "Russia", "isp": "TestISP"}
-    with patch("proxyctl.requests") as mock_req:
-        mock_req.get.return_value = mock_resp
+    with patch("proxyctl.http_probe", return_value=(True, "1.2.3.4 | Russia | TestISP | 42ms", 42.0)):
         proxyctl.cmd_test_active(_make_args(timeout=10.0))
     out = capsys.readouterr().out
     assert "OK" in out

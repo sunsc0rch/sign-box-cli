@@ -317,6 +317,12 @@ class ProxyLibrary:
     def all(self) -> list:
         return [(int(k), v) for k, v in self._data["proxies"].items()]
 
+    def set_live(self, id_: int, value: Optional[bool]):
+        entry = self.get(id_)
+        if entry is not None:
+            entry["live"] = value
+            self.save()
+
     def remove(self, id_: int) -> bool:
         key = str(id_)
         if key in self._data["proxies"]:
@@ -596,12 +602,14 @@ def cmd_list(args):
         print("No proxies found.")
         return
 
-    print(f"{'ID':>4}  {'Protocol':<14}  {'Country':<4}  {'Host':<38}  {'Port'}  Tag")
-    print("─" * 90)
+    print(f"{'ID':>4}  {'Protocol':<14}  {'Country':<4}  {'Host':<38}  {'Port'}  {'L':<1}  Tag")
+    print("─" * 92)
     for id_, v in proxies:
+        live = v.get("live")
+        live_sym = "✓" if live is True else "✗" if live is False else "·"
         print(
             f"{id_:>4}  {v['protocol']:<14}  {v.get('country') or '??':<4}  "
-            f"{v['host']:<38}  {v['port']:<6}  {v['tag'][:40]}"
+            f"{v['host']:<38}  {v['port']:<6}  {live_sym}  {v['tag'][:40]}"
         )
 
 
@@ -923,32 +931,18 @@ def cmd_test_all(args):
 
 def cmd_test_active(args):
     state = load_state()
-    if state.get("active_id") is None:
+    active_id = state.get("active_id")
+    if active_id is None:
         print("No active proxy. Use 'proxyctl use <id>' first.", file=sys.stderr)
         sys.exit(1)
-    if requests is None:
-        print("Error: 'requests' library not installed. Run: pip install requests", file=sys.stderr)
-        sys.exit(1)
 
-    proxy_url = "http://127.0.0.1:7890"
-    test_url = "http://ip-api.com/json"
-    try:
-        resp = requests.get(
-            test_url,
-            proxies={"http": proxy_url, "https": proxy_url},
-            timeout=args.timeout,
-        )
-        if resp.status_code != 200:
-            print(f"FAIL: upstream returned HTTP {resp.status_code}", file=sys.stderr)
-            sys.exit(1)
-        data = resp.json()
-        print(
-            f"OK — IP: {data.get('query', '?')} | "
-            f"Country: {data.get('country', '?')} | "
-            f"ISP: {data.get('isp', '?')}"
-        )
-    except Exception as e:
-        print(f"FAIL: {e}", file=sys.stderr)
+    ok, msg, _ = http_probe(timeout=args.timeout)
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    lib.set_live(active_id, ok)
+    if ok:
+        print(f"OK — {msg}")
+    else:
+        print(f"FAIL: {msg}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -1136,8 +1130,8 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
         stdscr.addstr(1, 0, "─" * (w - 1))
 
         list_h = h - 4
-        id_w, proto_w, country_w, lat_w, host_w = 5, 8, 4, 6, 23
-        tag_w = max(8, w - id_w - proto_w - country_w - lat_w - host_w - 13)
+        id_w, proto_w, country_w, lat_w, live_w, host_w = 5, 8, 4, 6, 2, 23
+        tag_w = max(8, w - id_w - proto_w - country_w - lat_w - live_w - host_w - 13)
 
         for i, (pid, entry) in enumerate(proxies[scroll_off:scroll_off + list_h]):
             row = 2 + i
@@ -1152,6 +1146,9 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
             country = (entry.get("country") or "--")[:country_w]
             tag = _wcstrunc(entry.get("tag", ""), tag_w)
             host = f"{entry.get('host','')}:{entry.get('port','')}".ljust(host_w)[:host_w]
+            live_val = entry.get("live")
+            live_sym = "✓" if live_val is True else "✗" if live_val is False else "·"
+            live_color = 1 if live_val is True else 3 if live_val is False else 0
             lat = latencies.get(pid)
             if isinstance(lat, str):       # testing in progress: "…2s"
                 lat_str = lat.rjust(lat_w)
@@ -1168,8 +1165,8 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
 
             prefix = _wcstrunc(
                 f"{cursor}{check}{active} {pid:>{id_w}}  {proto:<{proto_w}} {country:<{country_w}}  "
-                f"{tag:<{tag_w}}  {host} ", w - lat_w - 1)
-            line = (prefix + lat_str)[:w - 1].ljust(w - 1)
+                f"{tag:<{tag_w}}  {host} ", w - lat_w - live_w - 1)
+            line = (prefix + lat_str + " " + live_sym)[:w - 1].ljust(w - 1)
 
             attr = curses.A_REVERSE if is_sel else curses.A_NORMAL
             if is_marked and curses.has_colors():
@@ -1178,9 +1175,14 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
                 attr |= curses.color_pair(1)
             try:
                 stdscr.addstr(row, 0, line, attr)
-                if lat_color and curses.has_colors() and not is_sel:
-                    col = max(0, min(w - lat_w - 1, len(prefix)))
-                    stdscr.addstr(row, col, lat_str, curses.color_pair(lat_color))
+                if not is_sel and curses.has_colors():
+                    lat_col = max(0, min(w - lat_w - live_w - 1, len(prefix)))
+                    if lat_color:
+                        stdscr.addstr(row, lat_col, lat_str, curses.color_pair(lat_color))
+                    live_col = lat_col + lat_w + 1
+                    if live_col < w - 1:
+                        stdscr.addstr(row, live_col, live_sym,
+                                      curses.color_pair(live_color) if live_color else curses.A_DIM)
             except curses.error:
                 pass
 
@@ -1391,6 +1393,11 @@ def _tui_main(stdscr):
                 stdscr.timeout(-1)
 
                 ok, msg, _ = result[0]
+                active_id = state.get("active_id")
+                if active_id is not None:
+                    lib = ProxyLibrary(PROXIES_FILE).load()
+                    lib.set_live(active_id, ok)
+                    proxies = lib.all()
                 if ok:
                     status_msg = f" ✓ {msg}"
                 else:
