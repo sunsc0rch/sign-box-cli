@@ -330,10 +330,21 @@ class ProxyLibrary:
 
 # ── State ────────────────────────────────────────────────────────────────────
 
+_STATE_DEFAULTS: dict = {
+    "active_id": None,
+    "mode": "socks",
+    "dns": "tls://1.1.1.1",
+    "utls": "chrome",
+}
+
 def load_state() -> dict:
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {"active_id": None, "mode": "socks"}
+        state = json.loads(STATE_FILE.read_text())
+        for k, v in _STATE_DEFAULTS.items():
+            if state.get(k) is None and v is not None:
+                state[k] = v
+        return state
+    return dict(_STATE_DEFAULTS)
 
 
 def save_state(state: dict):
@@ -379,6 +390,7 @@ def generate_active_config(
     bypass: Optional[list] = None,
     dns: Optional[str] = None,
     clash_api: bool = False,
+    utls: Optional[str] = None,
 ) -> dict:
     inbounds = [
         {"type": "http",  "tag": "http-in",  "listen": "::", "listen_port": 7890},
@@ -394,6 +406,14 @@ def generate_active_config(
             "strict_route": True,
             "sniff": True,
         })
+
+    if utls and outbound.get("type") in ("vless", "trojan", "vmess"):
+        tls = outbound.setdefault("tls", {"enabled": True})
+        if not tls.get("utls"):
+            tls["utls"] = {"enabled": True, "fingerprint": utls}
+
+    if utls and outbound.get("type") == "vless":
+        outbound.setdefault("packet_encoding", "xudp")
 
     route: dict = {"final": outbound["tag"]}
     if bypass:
@@ -749,7 +769,15 @@ def _resolve_use_settings(args, state: dict) -> tuple:
     else:
         clash_api = raw_clash == "on"
 
-    return bypass, dns, clash_api
+    raw_utls = getattr(args, "utls", None)
+    if raw_utls is None:
+        utls = state.get("utls")
+    elif raw_utls.lower() == "off":
+        utls = None
+    else:
+        utls = raw_utls.lower()
+
+    return bypass, dns, clash_api, utls
 
 
 def cmd_use(args):
@@ -760,10 +788,10 @@ def cmd_use(args):
         print(f"Error: proxy {args.id} not found.", file=sys.stderr)
         sys.exit(1)
 
-    bypass, dns, clash_api = _resolve_use_settings(args, state)
+    bypass, dns, clash_api, utls = _resolve_use_settings(args, state)
 
     config = generate_active_config(proxy["outbound"], mode=args.mode,
-                                    bypass=bypass, dns=dns, clash_api=clash_api)
+                                    bypass=bypass, dns=dns, clash_api=clash_api, utls=utls)
     SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     tmp = SING_BOX_CONFIG.with_suffix(".tmp")
     tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False))
@@ -775,6 +803,7 @@ def cmd_use(args):
         "bypass": bypass,
         "dns": dns,
         "clash_api": clash_api,
+        "utls": utls,
     })
     save_state(state)
 
@@ -808,6 +837,8 @@ def cmd_use(args):
         summary_parts.append(f"dns={dns}")
     if clash_api:
         summary_parts.append("clash-api=:9090")
+    if utls:
+        summary_parts.append(f"utls={utls}")
     print(" | ".join(summary_parts))
     print("Setting system proxy...")
     set_sysproxy(True)
@@ -840,6 +871,7 @@ def cmd_status(args):
     bypass = state.get("bypass") or []
     dns = state.get("dns")
     clash_api = state.get("clash_api", False)
+    utls = state.get("utls")
 
     print(f"Active proxy: [{active_id}] {proxy['tag']}")
     print(f"Protocol:     {proxy['protocol']}")
@@ -848,6 +880,7 @@ def cmd_status(args):
     print(f"Bypass:       {','.join(bypass) if bypass else 'off'}")
     print(f"DNS:          {dns if dns else 'default'}")
     print(f"Clash API:    {'on (:9090)' if clash_api else 'off'}")
+    print(f"uTLS:         {utls if utls else 'off'}")
     print(f"sing-box:     {svc_status}")
     print(f"System proxy: {'on' if state.get('sysproxy') else 'off'}")
     print(f"HTTP proxy:   http://127.0.0.1:7890")
@@ -993,6 +1026,7 @@ def cmd_tun(args):
         bypass=state.get("bypass") or [],
         dns=state.get("dns"),
         clash_api=state.get("clash_api", False),
+        utls=state.get("utls"),
     )
     SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     tmp = SING_BOX_CONFIG.with_suffix(".tmp")
@@ -1264,7 +1298,7 @@ def _tui_main(stdscr):
             pid, entry = proxies[selected]
             ns = argparse.Namespace(
                 id=pid, mode=state.get("mode", "socks"),
-                bypass=None, dns=None, clash_api=None,
+                bypass=None, dns=None, clash_api=None, utls=None,
             )
             _tui_suspend(stdscr, cmd_use, ns)
             state = load_state()
@@ -1453,7 +1487,7 @@ def main():
     p = sub.add_parser("add");      p.add_argument("source")
     p = sub.add_parser("list");     p.add_argument("--protocol"); p.add_argument("--country")
     p = sub.add_parser("show");     p.add_argument("id", type=int)
-    p = sub.add_parser("use");      p.add_argument("id", type=int); p.add_argument("--mode", choices=["socks","tun"], default="socks"); p.add_argument("--bypass", default=None, metavar="CC", help="Country codes to route direct, comma-separated (e.g. ru,cn). 'off' to disable"); p.add_argument("--dns", default=None, help="DNS server address (e.g. 8.8.8.8 or tls://1.1.1.1). 'off' to disable"); p.add_argument("--clash-api", dest="clash_api", choices=["on","off"], default=None, help="Enable Clash API on :9090")
+    p = sub.add_parser("use");      p.add_argument("id", type=int); p.add_argument("--mode", choices=["socks","tun"], default="socks"); p.add_argument("--bypass", default=None, metavar="CC", help="Country codes to route direct, comma-separated (e.g. ru,cn). 'off' to disable"); p.add_argument("--dns", default=None, help="DNS server address (e.g. 8.8.8.8 or tls://1.1.1.1). 'off' to disable"); p.add_argument("--clash-api", dest="clash_api", choices=["on","off"], default=None, help="Enable Clash API on :9090"); p.add_argument("--utls", default=None, metavar="FP", help="uTLS fingerprint (chrome, firefox, safari, random). 'off' to disable")
     sub.add_parser("status")
     p = sub.add_parser("test");     p.add_argument("id", type=int); p.add_argument("--timeout", type=float, default=5.0)
     p = sub.add_parser("test-all"); p.add_argument("--timeout", type=float, default=5.0)

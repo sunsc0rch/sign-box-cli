@@ -160,3 +160,27 @@ def test_no_clash_api_no_experimental():
     out = parse_uri(VLESS_REALITY)
     cfg = generate_active_config(out)
     assert "experimental" not in cfg
+
+
+def test_utls_injects_fingerprint():
+    out = parse_uri(VLESS_REALITY)
+    cfg = generate_active_config(out, utls="chrome")
+    proxy_out = next(o for o in cfg["outbounds"] if o["type"] == "vless")
+    assert proxy_out["tls"]["utls"]["fingerprint"] == "chrome"
+    assert proxy_out["packet_encoding"] == "xudp"
+
+
+def test_utls_does_not_override_existing_fp():
+    out = parse_uri(VLESS_REALITY)
+    out["tls"]["utls"] = {"enabled": True, "fingerprint": "firefox"}
+    cfg = generate_active_config(out, utls="chrome")
+    proxy_out = next(o for o in cfg["outbounds"] if o["type"] == "vless")
+    assert proxy_out["tls"]["utls"]["fingerprint"] == "firefox"
+
+
+def test_no_utls_no_fingerprint():
+    # HYSTERIA2 has TLS but no fp in URI
+    out = parse_uri(HYSTERIA2)
+    cfg = generate_active_config(out)
+    proxy_out = next(o for o in cfg["outbounds"] if o["type"] == "hysteria2")
+    assert "utls" not in proxy_out.get("tls", {})
