@@ -451,6 +451,29 @@ def tcp_test(host: str, port: int, timeout: float = 5.0) -> Optional[float]:
         return None
 
 
+def http_probe(proxy_url: str = "http://127.0.0.1:7890",
+               test_url: str = "http://ip-api.com/json",
+               timeout: float = 10.0):
+    """HTTP request through proxy. Returns (ok, message, ms)."""
+    import urllib.request
+    try:
+        handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        opener = urllib.request.build_opener(handler)
+        start = time.time()
+        with opener.open(test_url, timeout=timeout) as resp:
+            ms = (time.time() - start) * 1000
+            if resp.status != 200:
+                return False, f"HTTP {resp.status}", ms
+            import json as _json
+            data = _json.loads(resp.read().decode())
+        ip = data.get("query", "?")
+        country = data.get("country", "?")
+        isp = data.get("isp", "?")
+        return True, f"{ip} | {country} | {isp} | {ms:.0f}ms", ms
+    except Exception as e:
+        return False, str(e), 0.0
+
+
 # ── CLI Commands ─────────────────────────────────────────────────────────────
 
 def cmd_add(args):
@@ -1083,7 +1106,7 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
         elif marked_ids:
             footer = f" [{len(marked_ids)} marked]  Space: toggle  D: delete marked  Esc: clear  Q: quit"
         else:
-            footer = " ↑↓/jk: nav  Space: mark  U: use  T: test  A: test all  D: del  F: del FAIL  Q: quit"
+            footer = " ↑↓/jk: nav  Spc: mark  U: use  T: test  A: all  P: probe  D: del  F: del FAIL  Q: quit"
         try:
             stdscr.addstr(h - 1, 0, _wcstrunc(footer, w - 1))
         except curses.error:
@@ -1259,6 +1282,35 @@ def _tui_main(stdscr):
                 status_msg = f" Deleted {removed} proxy(ies)"
             else:
                 status_msg = " Cancelled"
+
+        elif key in (ord('p'), ord('P')):
+            state = load_state()
+            if state.get("active_id") is None:
+                status_msg = " No active proxy — use U/Enter to activate one first"
+            else:
+                result: list = [None]
+                done = threading.Event()
+
+                def _run_probe():
+                    result[0] = http_probe()
+                    done.set()
+
+                threading.Thread(target=_run_probe, daemon=True).start()
+
+                t_start = time.time()
+                stdscr.timeout(200)
+                while not done.is_set():
+                    elapsed = time.time() - t_start
+                    _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies,
+                              f" Probing active proxy... {elapsed:.0f}s", marked_ids)
+                    stdscr.getch()
+                stdscr.timeout(-1)
+
+                ok, msg, _ = result[0]
+                if ok:
+                    status_msg = f" ✓ {msg}"
+                else:
+                    status_msg = f" ✗ FAIL: {msg}"
 
         elif key in (ord('a'), ord('A')):
             total = len(proxies)
