@@ -451,27 +451,40 @@ def tcp_test(host: str, port: int, timeout: float = 5.0) -> Optional[float]:
         return None
 
 
-def http_probe(proxy_url: str = "http://127.0.0.1:7890",
-               test_url: str = "http://ip-api.com/json",
-               timeout: float = 10.0):
-    """HTTP request through proxy. Returns (ok, message, ms)."""
+def http_probe(proxy_url: str = "http://127.0.0.1:7890", timeout: float = 15.0):
+    """HTTP probe through proxy. Returns (ok, message, ms).
+
+    Step 1: connectivity check via gstatic generate_204 (fast, globally reliable).
+    Step 2: best-effort IP lookup via ip-api.com (skipped if slow/blocked).
+    """
     import urllib.request
+    import json as _json
+
+    handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    opener = urllib.request.build_opener(handler)
+
+    # Step 1: connectivity
     try:
-        handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-        opener = urllib.request.build_opener(handler)
         start = time.time()
-        with opener.open(test_url, timeout=timeout) as resp:
+        with opener.open("http://connectivitycheck.gstatic.com/generate_204",
+                         timeout=timeout) as resp:
             ms = (time.time() - start) * 1000
-            if resp.status != 200:
+            if resp.status not in (200, 204):
                 return False, f"HTTP {resp.status}", ms
-            import json as _json
+    except Exception as e:
+        return False, str(e), 0.0
+
+    # Step 2: IP info (best-effort, short timeout)
+    try:
+        with opener.open("http://ip-api.com/json?fields=query,country,isp",
+                         timeout=5.0) as resp:
             data = _json.loads(resp.read().decode())
         ip = data.get("query", "?")
         country = data.get("country", "?")
         isp = data.get("isp", "?")
         return True, f"{ip} | {country} | {isp} | {ms:.0f}ms", ms
-    except Exception as e:
-        return False, str(e), 0.0
+    except Exception:
+        return True, f"OK | {ms:.0f}ms (IP lookup unavailable)", ms
 
 
 # ── CLI Commands ─────────────────────────────────────────────────────────────
