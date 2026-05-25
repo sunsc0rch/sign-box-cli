@@ -9,7 +9,8 @@
 - Библиотека прокси с фильтрацией по протоколу и стране
 - Режим SOCKS5/HTTP (порты 7890/7891/7892), TUN (прозрачный прокси) и System Proxy (GNOME + `/etc/environment`)
 - Bypass-роутинг: внутренний трафик напрямую, зарубежный через прокси (geoip + geosite rule-sets)
-- Настраиваемый DNS-сервер (plain, DoT, DoH)
+- Настраиваемый DNS-сервер (plain, DoT, DoH) — по умолчанию `tls://1.1.1.1`
+- uTLS fingerprint (chrome, firefox, safari) для обхода TLS-детектирования — по умолчанию `chrome`
 - Clash API для подключения веб-дашбордов (Yacd, Metacubex)
 - Тест задержки (TCP) и end-to-end проверка через прокси
 - Единый Python-файл — деплой через `scp`
@@ -99,13 +100,17 @@ proxyctl use 5 --bypass ru,cn          # несколько стран
 proxyctl use 5 --bypass off            # выключить bypass
 proxyctl use 5 --dns 8.8.8.8          # свой DNS-сервер
 proxyctl use 5 --dns tls://1.1.1.1    # DNS over TLS
-proxyctl use 5 --dns off               # вернуть DNS по умолчанию
+proxyctl use 5 --dns off               # вернуть DNS по умолчанию (системный)
+proxyctl use 5 --utls chrome           # uTLS fingerprint: chrome / firefox / safari / random
+proxyctl use 5 --utls off             # выключить uTLS
 proxyctl use 5 --clash-api on         # включить Clash API на :9090
 proxyctl use 5 --clash-api off        # выключить
 proxyctl status                        # активный прокси + все настройки
 ```
 
-Флаги `--bypass`, `--dns`, `--clash-api` **сохраняются в state** — при следующем `proxyctl use <id>` они наследуются автоматически.
+Флаги `--bypass`, `--dns`, `--utls`, `--clash-api` **сохраняются в state** — при следующем `proxyctl use <id>` они наследуются автоматически.
+
+По умолчанию при первом запуске: `dns=tls://1.1.1.1`, `utls=chrome`, `sysproxy=on`.
 
 ### Тестирование
 
@@ -134,6 +139,20 @@ proxyctl use 5 --dns tls://1.1.1.1    # Cloudflare DoT
 proxyctl use 5 --dns https://dns.google/dns-query  # DoH
 proxyctl use 5 --dns off               # DNS по умолчанию (системный)
 ```
+
+### uTLS
+
+Подменяет TLS fingerprint на браузерный, скрывая от DPI и прокси-бэкендов, что соединение установлено не браузером. Особенно важно для прокси через Cloudflare Workers и CDN-фронтенды.
+
+```bash
+proxyctl use 5 --utls chrome    # Chrome fingerprint (по умолчанию)
+proxyctl use 5 --utls firefox   # Firefox fingerprint
+proxyctl use 5 --utls safari    # Safari fingerprint
+proxyctl use 5 --utls random    # случайный при каждом подключении
+proxyctl use 5 --utls off       # отключить
+```
+
+Если URI содержит параметр `fp=` (например `fp=chrome`), он имеет приоритет над глобальным флагом. При включённом `--utls` для VLESS автоматически добавляется `packet_encoding: xudp`.
 
 ### Clash API
 
@@ -233,4 +252,4 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-100 тестов покрывают парсеры URI, библиотеку прокси, генератор конфигов (bypass/DNS/Clash API), CLI-команды и system proxy.
+114 тестов покрывают парсеры URI, библиотеку прокси, генератор конфигов (bypass/DNS/uTLS/Clash API), CLI-команды и system proxy.
