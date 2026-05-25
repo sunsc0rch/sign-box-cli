@@ -150,11 +150,22 @@ def test_show_nonexistent_exits(tmp_library, monkeypatch):
 
 # ── service / use / status ────────────────────────────────────────────────────
 
-def test_service_action_calls_systemctl():
+def test_service_action_calls_sudo_first():
     with patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0)
         proxyctl.service_action("start")
         mock_run.assert_called_once_with(
+            ["sudo", "-n", "systemctl", "start", "sing-box"], capture_output=True, text=True
+        )
+
+
+def test_service_action_falls_back_to_systemctl():
+    # sudo -n fails (returncode=1) → should retry with plain systemctl
+    results = [MagicMock(returncode=1, stderr=""), MagicMock(returncode=0)]
+    with patch("subprocess.run", side_effect=results) as mock_run:
+        proxyctl.service_action("start")
+        assert mock_run.call_count == 2
+        mock_run.assert_called_with(
             ["systemctl", "start", "sing-box"], capture_output=True, text=True
         )
 

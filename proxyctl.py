@@ -417,13 +417,22 @@ def generate_active_config(
 
 # ── Service Management ───────────────────────────────────────────────────────
 
-def service_action(action: str):
-    result = subprocess.run(
-        ["systemctl", action, "sing-box"], capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        print(f"Error running systemctl {action}: {result.stderr.strip()}", file=sys.stderr)
-        sys.exit(1)
+def service_action(action: str, silent: bool = False):
+    # Try sudo -n first (non-interactive, avoids polkit prompt in TUI/SSH).
+    # Fall back to plain systemctl if sudo is not available.
+    for cmd in (
+        ["sudo", "-n", "systemctl", action, "sing-box"],
+        ["systemctl", action, "sing-box"],
+    ):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        # sudo not configured — try plain systemctl next iteration
+        if cmd[0] == "sudo":
+            continue
+        if not silent:
+            print(f"Error running systemctl {action}: {result.stderr.strip()}", file=sys.stderr)
+            sys.exit(1)
 
 
 def cmd_logs(args):
@@ -1239,7 +1248,7 @@ def _tui_main(stdscr):
                         removed += 1
                         latencies.pop(pid, None)
                         if state.get("active_id") == pid and not stopped:
-                            service_action("stop")
+                            service_action("stop", silent=True)
                             stopped = True
                 lib.save()
                 if stopped:
@@ -1305,7 +1314,7 @@ def _tui_main(stdscr):
                             removed += 1
                             latencies.pop(pid, None)
                             if state.get("active_id") == pid and not stopped:
-                                service_action("stop")
+                                service_action("stop", silent=True)
                                 stopped = True
                     lib.save()
                     if stopped:
