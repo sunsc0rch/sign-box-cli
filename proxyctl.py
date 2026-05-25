@@ -1319,7 +1319,6 @@ def _tui_main(stdscr):
                     lib.save()
                     if stopped:
                         state = load_state()
-                    marked_ids.discard(*fail_ids) if fail_ids else None
                     marked_ids -= set(fail_ids)
                     proxies = lib.all()
                     selected = min(selected, max(0, len(proxies) - 1))
