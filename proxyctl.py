@@ -86,6 +86,13 @@ def parse_vless(uri: str) -> dict:
         host_header = params.get("host", "")
         if host_header:
             transport["headers"] = {"Host": host_header}
+        ed = params.get("ed", "")
+        if ed:
+            try:
+                transport["max_early_data"] = int(ed)
+                transport["early_data_header_name"] = params.get("eh", "Sec-WebSocket-Protocol")
+            except ValueError:
+                pass
         outbound["transport"] = transport
     elif transport_type == "grpc":
         transport = {"type": "grpc"}
