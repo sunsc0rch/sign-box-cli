@@ -114,8 +114,33 @@ def test_dns_adds_dns_section():
     out = parse_uri(VLESS_REALITY)
     cfg = generate_active_config(out, dns="8.8.8.8")
     assert "dns" in cfg
-    assert cfg["dns"]["servers"][0]["address"] == "8.8.8.8"
+    srv = cfg["dns"]["servers"][0]
+    assert srv["tag"] == "dns-main"
+    assert srv["type"] == "udp"
+    assert srv["server"] == "8.8.8.8"
     assert cfg["dns"]["final"] == "dns-main"
+
+
+def test_dns_tls_format():
+    from proxyctl import _build_dns_server
+    s = _build_dns_server("tls://1.1.1.1")
+    assert s == {"tag": "dns-main", "type": "tls", "server": "1.1.1.1"}
+
+
+def test_dns_https_format():
+    from proxyctl import _build_dns_server
+    s = _build_dns_server("https://dns.google/dns-query")
+    assert s["type"] == "https"
+    assert s["server"] == "dns.google"
+    assert s["path"] == "/dns-query"
+
+
+def test_dns_plain_ip_with_port():
+    from proxyctl import _build_dns_server
+    s = _build_dns_server("8.8.8.8:5353")
+    assert s["type"] == "udp"
+    assert s["server"] == "8.8.8.8"
+    assert s["server_port"] == 5353
 
 
 def test_no_dns_no_dns_section():

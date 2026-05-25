@@ -343,6 +343,36 @@ def save_state(state: dict):
 
 # ── Config Generator ─────────────────────────────────────────────────────────
 
+def _build_dns_server(address: str) -> dict:
+    """Convert user DNS string to sing-box 1.12+ server object (tag+type+server)."""
+    entry: dict = {"tag": "dns-main"}
+    if address.startswith("tls://"):
+        entry["type"] = "tls"
+        entry["server"] = address[6:]
+    elif address.startswith("https://"):
+        parsed = urllib.parse.urlparse(address)
+        entry["type"] = "https"
+        entry["server"] = parsed.hostname
+        if parsed.path and parsed.path != "/":
+            entry["path"] = parsed.path
+    elif address.startswith("h3://"):
+        parsed = urllib.parse.urlparse(address)
+        entry["type"] = "h3"
+        entry["server"] = parsed.hostname
+        if parsed.path and parsed.path != "/":
+            entry["path"] = parsed.path
+    else:
+        # plain IP or IP:port
+        if ":" in address:
+            host, port = address.rsplit(":", 1)
+            entry["type"] = "udp"
+            entry["server"] = host
+            entry["server_port"] = int(port)
+        else:
+            entry["type"] = "udp"
+            entry["server"] = address
+    return entry
+
 def generate_active_config(
     outbound: dict,
     mode: str = "socks",
@@ -407,7 +437,7 @@ def generate_active_config(
 
     if dns:
         config["dns"] = {
-            "servers": [{"tag": "dns-main", "address": dns}],
+            "servers": [_build_dns_server(dns)],
             "final": "dns-main",
         }
 
