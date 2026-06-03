@@ -1750,24 +1750,217 @@ def main():
         cmd_tui()
         return
 
-    parser = argparse.ArgumentParser(prog="proxyctl", description="Manage sing-box proxies")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(
+        prog="proxyctl",
+        description="CLI/TUI manager for sing-box proxy on a remote Ubuntu server.",
+        epilog=(
+            "Run without arguments to open the interactive TUI.\n\n"
+            "Quick start:\n"
+            "  proxyctl add proxies.txt   # load URIs from file\n"
+            "  proxyctl list              # show library\n"
+            "  proxyctl use 1             # activate proxy #1\n"
+            "  proxyctl status            # show active proxy and settings\n"
+            "  proxyctl probe-all         # HTTP-probe all proxies\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
-    sub.add_parser("compact")
-    p = sub.add_parser("add");      p.add_argument("source")
-    p = sub.add_parser("list");     p.add_argument("--protocol"); p.add_argument("--country")
-    p = sub.add_parser("show");     p.add_argument("id", type=int)
-    p = sub.add_parser("use");      p.add_argument("id", type=int); p.add_argument("--mode", choices=["socks","tun"], default="socks"); p.add_argument("--bypass", default=None, metavar="CC", help="Country codes to route direct, comma-separated (e.g. ru,cn). 'off' to disable"); p.add_argument("--dns", default=None, help="DNS server address (e.g. 8.8.8.8 or tls://1.1.1.1). 'off' to disable"); p.add_argument("--clash-api", dest="clash_api", choices=["on","off"], default=None, help="Enable Clash API on :9090"); p.add_argument("--utls", default=None, metavar="FP", help="uTLS fingerprint (chrome, firefox, safari, random). 'off' to disable")
-    sub.add_parser("status")
-    p = sub.add_parser("test");     p.add_argument("id", type=int); p.add_argument("--timeout", type=float, default=5.0)
-    p = sub.add_parser("test-all"); p.add_argument("--timeout", type=float, default=5.0)
-    p = sub.add_parser("test-active"); p.add_argument("--timeout", type=float, default=10.0)
-    p = sub.add_parser("probe-all");  p.add_argument("--timeout", type=float, default=PROBE_BULK_TIMEOUT)
-    p = sub.add_parser("remove");   p.add_argument("ids", nargs="*"); p.add_argument("--all", action="store_true"); p.add_argument("--protocol"); p.add_argument("--country")
-    sub.add_parser("start"); sub.add_parser("stop"); sub.add_parser("restart"); sub.add_parser("logs")
-    p = sub.add_parser("tun");      p.add_argument("action", choices=["on","off"])
-    p = sub.add_parser("sysproxy"); p.add_argument("action", choices=["on","off","status"])
-    sub.add_parser("install")
+    # ── Library ──────────────────────────────────────────────────────────────
+    sub.add_parser(
+        "compact",
+        help="renumber all proxy IDs starting from 1",
+        description=(
+            "Renumber all proxies in the library starting from 1, eliminating gaps.\n"
+            "Updates active_id in state automatically. sing-box is not restarted."
+        ),
+    )
+
+    p = sub.add_parser(
+        "add",
+        help="add proxies from a file or a single URI",
+        description=(
+            "Add proxies from a text file (one URI per line) or a single URI string.\n"
+            "Supported protocols: vless://, vmess://, trojan://, ss://, hysteria2://\n"
+            "Country is auto-detected from flag emoji in the tag (e.g. 🇩🇪)."
+        ),
+    )
+    p.add_argument(
+        "source",
+        help="path to a text file with URIs, or a single URI string",
+    )
+
+    p = sub.add_parser(
+        "list",
+        help="list proxies in the library",
+        description="Print the proxy library as a table: ID | protocol | country | host | port | live | tag.",
+    )
+    p.add_argument("--protocol", metavar="PROTO",
+                   help="filter by protocol (vless, vmess, trojan, ss, hysteria2)")
+    p.add_argument("--country", metavar="CC",
+                   help="filter by country code, e.g. RU or DE")
+
+    p = sub.add_parser(
+        "show",
+        help="show full details of a proxy",
+        description="Print all fields of proxy <id>, including the raw URI and full sing-box outbound JSON.",
+    )
+    p.add_argument("id", type=int, help="proxy ID")
+
+    # ── Activation ───────────────────────────────────────────────────────────
+    p = sub.add_parser(
+        "use",
+        help="activate a proxy (writes config, restarts sing-box)",
+        description=(
+            "Switch to proxy <id>: generate sing-box config, write it to\n"
+            "/etc/sing-box/active.json, restart the service, and enable system proxy.\n\n"
+            "All flags (--bypass, --dns, --utls, --clash-api) are persisted in state\n"
+            "and inherited by the next 'use' call automatically."
+        ),
+    )
+    p.add_argument("id", type=int, help="proxy ID to activate")
+    p.add_argument(
+        "--mode", choices=["socks", "tun"], default="socks",
+        help="proxy mode: socks (HTTP/SOCKS5 on ports 7890-7892) or tun (transparent, requires root). Default: socks",
+    )
+    p.add_argument(
+        "--bypass", default=None, metavar="CC[,CC]",
+        help=(
+            "Comma-separated country codes whose traffic goes direct (e.g. ru,cn).\n"
+            "Uses SagerNet geoip+geosite rule-sets updated daily by sing-box.\n"
+            "'off' to disable bypass routing."
+        ),
+    )
+    p.add_argument(
+        "--dns", default=None, metavar="ADDR",
+        help=(
+            "DNS server for sing-box to use. Formats:\n"
+            "  8.8.8.8              plain UDP\n"
+            "  8.8.8.8:5353         UDP on custom port\n"
+            "  tls://1.1.1.1        DNS-over-TLS (DoT)\n"
+            "  https://dns.google/dns-query  DNS-over-HTTPS (DoH)\n"
+            "'off' to remove custom DNS (use system resolver). Default: tls://1.1.1.1"
+        ),
+    )
+    p.add_argument(
+        "--utls", default=None, metavar="FP",
+        help=(
+            "uTLS fingerprint — makes TLS ClientHello look like a real browser.\n"
+            "Values: chrome, firefox, safari, random, off.\n"
+            "Especially important for proxies behind Cloudflare Workers / CDN frontends.\n"
+            "If the URI already contains fp=<value>, that takes precedence.\n"
+            "Default: chrome"
+        ),
+    )
+    p.add_argument(
+        "--clash-api", dest="clash_api", choices=["on", "off"], default=None,
+        help="enable (on) or disable (off) Clash-compatible REST API on 127.0.0.1:9090",
+    )
+
+    sub.add_parser(
+        "status",
+        help="show active proxy and current settings",
+        description="Print the active proxy ID, tag, sing-box service state, mode, DNS, uTLS, bypass, and proxy ports.",
+    )
+
+    # ── Testing ──────────────────────────────────────────────────────────────
+    p = sub.add_parser(
+        "test",
+        help="TCP latency to a proxy server",
+        description="Measure TCP connect time to the proxy server's host:port. Does not go through the proxy.",
+    )
+    p.add_argument("id", type=int, help="proxy ID")
+    p.add_argument("--timeout", type=float, default=5.0, metavar="SEC",
+                   help="connect timeout in seconds (default: 5)")
+
+    p = sub.add_parser(
+        "test-all",
+        help="TCP latency to all proxies",
+        description="Measure TCP connect time to all proxy servers in parallel and print a table.",
+    )
+    p.add_argument("--timeout", type=float, default=5.0, metavar="SEC",
+                   help="connect timeout per proxy in seconds (default: 5)")
+
+    p = sub.add_parser(
+        "test-active",
+        help="HTTP probe through the active proxy",
+        description=(
+            "Send an HTTP request through the running sing-box instance (port 7890).\n"
+            "Step 1: connectivity check via connectivitycheck.gstatic.com.\n"
+            "Step 2: IP/country/ISP lookup via ip-api.com.\n"
+            "Saves ✓/✗ live status to the active proxy in the library."
+        ),
+    )
+    p.add_argument("--timeout", type=float, default=10.0, metavar="SEC",
+                   help="HTTP request timeout in seconds (default: 10)")
+
+    p = sub.add_parser(
+        "probe-all",
+        help="HTTP probe all proxies in parallel",
+        description=(
+            "HTTP-probe every proxy in the library simultaneously (up to 8 at a time).\n"
+            "Active proxy is tested through port 7890. All others spin up a temporary\n"
+            "sing-box process on ports 17900-17907, run the probe, then terminate.\n"
+            "Saves ✓/✗ live status for each proxy. Results printed as they arrive."
+        ),
+    )
+    p.add_argument("--timeout", type=float, default=PROBE_BULK_TIMEOUT, metavar="SEC",
+                   help=f"HTTP request timeout per proxy in seconds (default: {PROBE_BULK_TIMEOUT:.0f})")
+
+    # ── Library management ───────────────────────────────────────────────────
+    p = sub.add_parser(
+        "remove",
+        help="remove proxies from the library",
+        description=(
+            "Remove one or more proxies by ID. Supports individual IDs, ranges, and filters.\n"
+            "If the removed proxy is active, sing-box is stopped."
+        ),
+    )
+    p.add_argument("ids", nargs="*",
+                   help="IDs to remove: individual (3), ranges (1-5), or mixed (1-5 8 10)")
+    p.add_argument("--all", action="store_true",
+                   help="remove all proxies from the library")
+    p.add_argument("--protocol", metavar="PROTO",
+                   help="remove all proxies with this protocol (e.g. vmess)")
+    p.add_argument("--country", metavar="CC",
+                   help="remove all proxies with this country code (e.g. RU)")
+
+    # ── Service ──────────────────────────────────────────────────────────────
+    sub.add_parser("start",   help="start the sing-box systemd service")
+    sub.add_parser("stop",    help="stop sing-box and disable system proxy")
+    sub.add_parser("restart", help="restart the sing-box systemd service")
+    sub.add_parser("logs",    help="show last 50 lines of sing-box journal logs")
+
+    p = sub.add_parser(
+        "tun",
+        help="enable or disable TUN (transparent proxy) mode",
+        description=(
+            "Switch between TUN and SOCKS modes.\n"
+            "TUN mode routes all system traffic transparently — requires root."
+        ),
+    )
+    p.add_argument("action", choices=["on", "off"], help="on: enable TUN, off: disable")
+
+    p = sub.add_parser(
+        "sysproxy",
+        help="manage system proxy settings (GNOME + /etc/environment)",
+        description=(
+            "Configure system-wide HTTP/SOCKS5 proxy.\n"
+            "  on:     set GNOME gsettings + /etc/environment to 127.0.0.1:7890\n"
+            "  off:    clear both\n"
+            "  status: show current state of both mechanisms"
+        ),
+    )
+    p.add_argument("action", choices=["on", "off", "status"])
+
+    sub.add_parser(
+        "install",
+        help="download sing-box binary and install systemd service",
+        description=(
+            "Download the latest sing-box release from GitHub, install it to\n"
+            "/usr/local/bin/sing-box, and create + enable a systemd service unit."
+        ),
+    )
 
     args = parser.parse_args()
     dispatch = {
