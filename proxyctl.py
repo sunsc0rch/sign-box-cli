@@ -29,8 +29,11 @@ PROXIES_FILE = CONFIG_DIR / "proxies.json"
 STATE_FILE = CONFIG_DIR / "state.json"
 SING_BOX_CONFIG = Path("/etc/sing-box/active.json")
 SING_BOX_BIN = "/usr/local/bin/sing-box"
-PROBE_ACTIVE_PORT = 7890       # port of the running sing-box instance
-PROBE_TEMP_PORT   = 17890      # temp port used when probing a non-active proxy
+PROBE_ACTIVE_PORT     = 7890   # port of the running sing-box instance
+PROBE_TEMP_PORT       = 17890  # temp port used when probing a single non-active proxy
+PROBE_TEMP_PORT_BASE  = 17900  # base of port pool for bulk probing (17900..17900+CONCURRENCY-1)
+PROBE_BULK_CONCURRENCY = 8     # max simultaneous temp sing-box processes during probe-all
+PROBE_BULK_TIMEOUT    = 8.0    # seconds per proxy during probe-all
 
 
 # ── URI Parsers ──────────────────────────────────────────────────────────────
@@ -556,6 +559,7 @@ def _probe_via_temp_singbox(
     outbound: dict,
     utls: Optional[str] = None,
     timeout: float = 15.0,
+    port: int = PROBE_TEMP_PORT,
 ):
     """Probe a non-active proxy by spawning a temporary sing-box process.
 
@@ -579,7 +583,7 @@ def _probe_via_temp_singbox(
                 "type": "mixed",
                 "tag": "mixed-in",
                 "listen": "127.0.0.1",
-                "listen_port": PROBE_TEMP_PORT,
+                "listen_port": port,
             }
         ],
         "outbounds": [out, {"type": "direct", "tag": "direct"}],
@@ -603,7 +607,7 @@ def _probe_via_temp_singbox(
             ready = False
             while time.time() < deadline:
                 try:
-                    s = socket.create_connection(("127.0.0.1", PROBE_TEMP_PORT), timeout=0.2)
+                    s = socket.create_connection(("127.0.0.1", port), timeout=0.2)
                     s.close()
                     ready = True
                     break
@@ -613,7 +617,7 @@ def _probe_via_temp_singbox(
             if not ready:
                 return False, "sing-box failed to start within 5 s", 0.0
 
-            return http_probe(f"http://127.0.0.1:{PROBE_TEMP_PORT}", timeout)
+            return http_probe(f"http://127.0.0.1:{port}", timeout)
         finally:
             proc.terminate()
             try:
@@ -1006,6 +1010,70 @@ def cmd_test_all(args):
         )
 
 
+def cmd_probe_all(args):
+    import queue as _queue
+
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    proxies = lib.all()
+    if not proxies:
+        print("No proxies in library.")
+        return
+
+    state = load_state()
+    active_id = state.get("active_id")
+    utls = state.get("utls")
+    timeout = args.timeout
+    total = len(proxies)
+
+    port_pool = _queue.Queue()
+    for i in range(PROBE_BULK_CONCURRENCY):
+        port_pool.put(PROBE_TEMP_PORT_BASE + i)
+
+    done_count = [0]
+    results: dict = {}
+    lock = threading.Lock()
+
+    def _probe_one(pid, entry):
+        outbound = entry.get("outbound", {})
+        if pid == active_id:
+            ok, msg, ms = http_probe(
+                f"http://127.0.0.1:{PROBE_ACTIVE_PORT}", timeout=timeout
+            )
+        else:
+            p = port_pool.get()
+            try:
+                ok, msg, ms = _probe_via_temp_singbox(
+                    outbound, utls=utls, timeout=timeout, port=p
+                )
+            finally:
+                port_pool.put(p)
+        sym = "✓" if ok else "✗"
+        with lock:
+            done_count[0] += 1
+            results[pid] = ok
+            tag = entry.get("tag", "")[:30]
+            print(f"[{done_count[0]:>3}/{total}] {sym} #{pid:<4} {tag:<30}  {msg}")
+
+    threads = [
+        threading.Thread(target=_probe_one, args=(pid, entry), daemon=True)
+        for pid, entry in proxies
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    lib2 = ProxyLibrary(PROXIES_FILE).load()
+    for pid, ok in results.items():
+        e = lib2.get(pid)
+        if e is not None:
+            e["live"] = ok
+    lib2.save()
+
+    ok_count = sum(1 for v in results.values() if v)
+    print(f"\n{ok_count}/{total} proxies live")
+
+
 def cmd_test_active(args):
     state = load_state()
     active_id = state.get("active_id")
@@ -1271,7 +1339,7 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
         elif marked_ids:
             footer = f" [{len(marked_ids)} marked]  Space: toggle  D: delete marked  Esc: clear  Q: quit"
         else:
-            footer = " ↑↓/jk: nav  Spc: mark  U: use  T: test  A: all  P: probe  D: del  F: del FAIL  Q: quit"
+            footer = " ↑↓/jk: nav  Spc: mark  U: use  T: lat  A: lat-all  p: probe  P: probe-all  D: del  F: del FAIL  Q: quit"
         try:
             stdscr.addstr(h - 1, 0, _wcstrunc(footer, w - 1))
         except curses.error:
@@ -1448,7 +1516,7 @@ def _tui_main(stdscr):
             else:
                 status_msg = " Cancelled"
 
-        elif key in (ord('p'), ord('P')):
+        elif key == ord('p'):
             state = load_state()
             sel_pid, sel_entry = proxies[selected]
             active_id = state.get("active_id")
@@ -1508,6 +1576,62 @@ def _tui_main(stdscr):
                 lib.set_live(sel_pid, ok)
                 proxies = lib.all()
                 status_msg = f" ✓ #{sel_pid} {msg}" if ok else f" ✗ #{sel_pid} FAIL: {msg}"
+
+        elif key == ord('P'):
+            import queue as _queue
+            total = len(proxies)
+            _state = load_state()
+            _active_id = _state.get("active_id")
+            _utls = _state.get("utls")
+            done_count_p = [0]
+            count_lock_p = threading.Lock()
+            all_done_p = threading.Event()
+            live_results: dict = {}
+
+            port_pool = _queue.Queue()
+            for _i in range(PROBE_BULK_CONCURRENCY):
+                port_pool.put(PROBE_TEMP_PORT_BASE + _i)
+
+            def _probe_http_one(pid, entry):
+                outbound = entry.get("outbound", {})
+                if pid == _active_id:
+                    ok, msg, ms = http_probe(
+                        f"http://127.0.0.1:{PROBE_ACTIVE_PORT}",
+                        timeout=PROBE_BULK_TIMEOUT,
+                    )
+                else:
+                    p = port_pool.get()
+                    try:
+                        ok, msg, ms = _probe_via_temp_singbox(
+                            outbound, utls=_utls, timeout=PROBE_BULK_TIMEOUT, port=p
+                        )
+                    finally:
+                        port_pool.put(p)
+                with count_lock_p:
+                    done_count_p[0] += 1
+                    live_results[pid] = ok
+                    if done_count_p[0] == total:
+                        all_done_p.set()
+
+            for pid, entry in proxies:
+                threading.Thread(target=_probe_http_one, args=(pid, entry), daemon=True).start()
+
+            stdscr.timeout(200)
+            while not all_done_p.is_set():
+                _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies,
+                          f" HTTP probing all... {done_count_p[0]}/{total}", marked_ids)
+                stdscr.getch()
+            stdscr.timeout(-1)
+
+            lib = ProxyLibrary(PROXIES_FILE).load()
+            for pid, ok in live_results.items():
+                e = lib.get(pid)
+                if e is not None:
+                    e["live"] = ok
+            lib.save()
+            proxies = lib.all()
+            ok_count = sum(1 for v in live_results.values() if v)
+            status_msg = f" HTTP probe done: {ok_count}/{total} live"
 
         elif key in (ord('a'), ord('A')):
             total = len(proxies)
@@ -1605,6 +1729,7 @@ def main():
     p = sub.add_parser("test");     p.add_argument("id", type=int); p.add_argument("--timeout", type=float, default=5.0)
     p = sub.add_parser("test-all"); p.add_argument("--timeout", type=float, default=5.0)
     p = sub.add_parser("test-active"); p.add_argument("--timeout", type=float, default=10.0)
+    p = sub.add_parser("probe-all");  p.add_argument("--timeout", type=float, default=PROBE_BULK_TIMEOUT)
     p = sub.add_parser("remove");   p.add_argument("ids", nargs="*"); p.add_argument("--all", action="store_true"); p.add_argument("--protocol"); p.add_argument("--country")
     sub.add_parser("start"); sub.add_parser("stop"); sub.add_parser("restart"); sub.add_parser("logs")
     p = sub.add_parser("tun");      p.add_argument("action", choices=["on","off"])
@@ -1616,6 +1741,7 @@ def main():
         "add": cmd_add, "list": cmd_list, "show": cmd_show,
         "use": cmd_use, "status": cmd_status,
         "test": cmd_test, "test-all": cmd_test_all, "test-active": cmd_test_active,
+        "probe-all": cmd_probe_all,
         "remove": cmd_remove,
         "start":   lambda a: service_action("start"),
         "stop":    cmd_stop,
