@@ -311,16 +311,17 @@ class ProxyLibrary:
         self.path.write_text(json.dumps(self._data, indent=2, ensure_ascii=False))
 
     def add(self, entry: dict) -> int:
-        id_ = self._data["next_id"]
+        existing = {int(k) for k in self._data["proxies"]}
+        id_ = next(i for i in range(1, len(existing) + 2) if i not in existing)
         self._data["proxies"][str(id_)] = entry
-        self._data["next_id"] += 1
+        self._data["next_id"] = max(existing | {id_}, default=0) + 1
         return id_
 
     def get(self, id_: int) -> Optional[dict]:
         return self._data["proxies"].get(str(id_))
 
     def all(self) -> list:
-        return [(int(k), v) for k, v in self._data["proxies"].items()]
+        return sorted([(int(k), v) for k, v in self._data["proxies"].items()])
 
     def set_live(self, id_: int, value: Optional[bool]):
         entry = self.get(id_)
@@ -337,6 +338,18 @@ class ProxyLibrary:
 
     def clear(self):
         self._data["proxies"] = {}
+
+    def compact(self) -> dict:
+        """Renumber all proxies starting from 1. Returns {old_id: new_id}."""
+        old_proxies = sorted(self._data["proxies"].items(), key=lambda x: int(x[0]))
+        mapping = {}
+        new_proxies = {}
+        for new_id, (old_key, entry) in enumerate(old_proxies, start=1):
+            mapping[int(old_key)] = new_id
+            new_proxies[str(new_id)] = entry
+        self._data["proxies"] = new_proxies
+        self._data["next_id"] = len(new_proxies) + 1
+        return mapping
 
 
 # ── State ────────────────────────────────────────────────────────────────────
@@ -632,6 +645,25 @@ def _probe_via_temp_singbox(
 
 
 # ── CLI Commands ─────────────────────────────────────────────────────────────
+
+def cmd_compact(args):
+    lib = ProxyLibrary(PROXIES_FILE).load()
+    if not lib.all():
+        print("Library is empty.")
+        return
+    mapping = lib.compact()
+    lib.save()
+
+    state = load_state()
+    active_id = state.get("active_id")
+    if active_id is not None and active_id in mapping:
+        state["active_id"] = mapping[active_id]
+        save_state(state)
+
+    print(f"Compacted {len(mapping)} proxies: IDs now 1–{len(mapping)}")
+    if active_id is not None and active_id in mapping:
+        print(f"Active proxy: #{active_id} → #{mapping[active_id]}")
+
 
 def cmd_add(args):
     source = args.source
@@ -1721,6 +1753,7 @@ def main():
     parser = argparse.ArgumentParser(prog="proxyctl", description="Manage sing-box proxies")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("compact")
     p = sub.add_parser("add");      p.add_argument("source")
     p = sub.add_parser("list");     p.add_argument("--protocol"); p.add_argument("--country")
     p = sub.add_parser("show");     p.add_argument("id", type=int)
@@ -1738,6 +1771,7 @@ def main():
 
     args = parser.parse_args()
     dispatch = {
+        "compact": cmd_compact,
         "add": cmd_add, "list": cmd_list, "show": cmd_show,
         "use": cmd_use, "status": cmd_status,
         "test": cmd_test, "test-all": cmd_test_all, "test-active": cmd_test_active,
