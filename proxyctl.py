@@ -29,6 +29,8 @@ PROXIES_FILE = CONFIG_DIR / "proxies.json"
 STATE_FILE = CONFIG_DIR / "state.json"
 SING_BOX_CONFIG = Path("/etc/sing-box/active.json")
 SING_BOX_BIN = "/usr/local/bin/sing-box"
+PROBE_ACTIVE_PORT = 7890       # port of the running sing-box instance
+PROBE_TEMP_PORT   = 17890      # temp port used when probing a non-active proxy
 
 
 # ── URI Parsers ──────────────────────────────────────────────────────────────
@@ -550,6 +552,81 @@ def http_probe(proxy_url: str = "http://127.0.0.1:7890", timeout: float = 15.0):
         return True, f"OK | {ms:.0f}ms (IP lookup unavailable)", ms
 
 
+def _probe_via_temp_singbox(
+    outbound: dict,
+    utls: Optional[str] = None,
+    timeout: float = 15.0,
+):
+    """Probe a non-active proxy by spawning a temporary sing-box process.
+
+    Starts sing-box on PROBE_TEMP_PORT, waits up to 5 s for it to bind,
+    runs http_probe through it, then terminates the process.
+    Returns (ok, msg, ms) — same as http_probe.
+    """
+    import copy, json as _json, tempfile
+
+    out = copy.deepcopy(outbound)
+    if utls and out.get("type") in ("vless", "trojan", "vmess"):
+        tls = out.setdefault("tls", {"enabled": True})
+        if not tls.get("utls"):
+            tls["utls"] = {"enabled": True, "fingerprint": utls}
+    if utls and out.get("type") == "vless":
+        out.setdefault("packet_encoding", "xudp")
+
+    config = {
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": PROBE_TEMP_PORT,
+            }
+        ],
+        "outbounds": [out, {"type": "direct", "tag": "direct"}],
+        "route": {"final": out["tag"]},
+    }
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="proxyctl_probe_", delete=False
+    )
+    try:
+        _json.dump(config, tmp)
+        tmp.close()
+
+        proc = subprocess.Popen(
+            [SING_BOX_BIN, "run", "-c", tmp.name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 5.0
+            ready = False
+            while time.time() < deadline:
+                try:
+                    s = socket.create_connection(("127.0.0.1", PROBE_TEMP_PORT), timeout=0.2)
+                    s.close()
+                    ready = True
+                    break
+                except OSError:
+                    time.sleep(0.1)
+
+            if not ready:
+                return False, "sing-box failed to start within 5 s", 0.0
+
+            return http_probe(f"http://127.0.0.1:{PROBE_TEMP_PORT}", timeout)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 # ── CLI Commands ─────────────────────────────────────────────────────────────
 
 def cmd_add(args):
@@ -936,7 +1013,9 @@ def cmd_test_active(args):
         print("No active proxy. Use 'proxyctl use <id>' first.", file=sys.stderr)
         sys.exit(1)
 
-    ok, msg, _ = http_probe(timeout=args.timeout)
+    proxy_url = f"http://127.0.0.1:{PROBE_ACTIVE_PORT}"
+    print(f"Probing via {proxy_url} ...")
+    ok, msg, _ = http_probe(proxy_url, timeout=args.timeout)
     lib = ProxyLibrary(PROXIES_FILE).load()
     lib.set_live(active_id, ok)
     if ok:
@@ -1371,37 +1450,64 @@ def _tui_main(stdscr):
 
         elif key in (ord('p'), ord('P')):
             state = load_state()
-            if state.get("active_id") is None:
+            sel_pid, sel_entry = proxies[selected]
+            active_id = state.get("active_id")
+            is_active_sel = sel_pid == active_id
+
+            if is_active_sel and active_id is None:
                 status_msg = " No active proxy — use U/Enter to activate one first"
-            else:
+            elif is_active_sel:
+                proxy_url = f"http://127.0.0.1:{PROBE_ACTIVE_PORT}"
                 result: list = [None]
                 done = threading.Event()
 
-                def _run_probe():
-                    result[0] = http_probe()
+                def _run_probe_active(url=proxy_url):
+                    result[0] = http_probe(url)
                     done.set()
 
-                threading.Thread(target=_run_probe, daemon=True).start()
+                threading.Thread(target=_run_probe_active, daemon=True).start()
 
                 t_start = time.time()
                 stdscr.timeout(200)
                 while not done.is_set():
                     elapsed = time.time() - t_start
                     _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies,
-                              f" Probing active proxy... {elapsed:.0f}s", marked_ids)
+                              f" Probing #{sel_pid} via {proxy_url}... {elapsed:.0f}s", marked_ids)
                     stdscr.getch()
                 stdscr.timeout(-1)
 
                 ok, msg, _ = result[0]
-                active_id = state.get("active_id")
-                if active_id is not None:
-                    lib = ProxyLibrary(PROXIES_FILE).load()
-                    lib.set_live(active_id, ok)
-                    proxies = lib.all()
-                if ok:
-                    status_msg = f" ✓ {msg}"
-                else:
-                    status_msg = f" ✗ FAIL: {msg}"
+                lib = ProxyLibrary(PROXIES_FILE).load()
+                lib.set_live(sel_pid, ok)
+                proxies = lib.all()
+                status_msg = f" ✓ #{sel_pid} {msg}" if ok else f" ✗ #{sel_pid} FAIL: {msg}"
+            else:
+                proxy_url = f"http://127.0.0.1:{PROBE_TEMP_PORT}"
+                result2: list = [None]
+                done2 = threading.Event()
+                _utls = state.get("utls")
+
+                def _run_probe_temp(entry=sel_entry, utls=_utls, url=proxy_url):
+                    result2[0] = _probe_via_temp_singbox(entry, utls=utls)
+                    done2.set()
+
+                threading.Thread(target=_run_probe_temp, daemon=True).start()
+
+                t_start = time.time()
+                stdscr.timeout(200)
+                while not done2.is_set():
+                    elapsed = time.time() - t_start
+                    _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies,
+                              f" Probing #{sel_pid} via {proxy_url} (temp)... {elapsed:.0f}s",
+                              marked_ids)
+                    stdscr.getch()
+                stdscr.timeout(-1)
+
+                ok, msg, _ = result2[0]
+                lib = ProxyLibrary(PROXIES_FILE).load()
+                lib.set_live(sel_pid, ok)
+                proxies = lib.all()
+                status_msg = f" ✓ #{sel_pid} {msg}" if ok else f" ✗ #{sel_pid} FAIL: {msg}"
 
         elif key in (ord('a'), ord('A')):
             total = len(proxies)
