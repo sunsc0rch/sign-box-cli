@@ -29,6 +29,23 @@ PROXIES_FILE = CONFIG_DIR / "proxies.json"
 STATE_FILE = CONFIG_DIR / "state.json"
 SING_BOX_CONFIG = Path("/etc/sing-box/active.json")
 SING_BOX_BIN = "/usr/local/bin/sing-box"
+SING_BOX_SERVICE_PATH = Path("/etc/systemd/system/sing-box.service")
+SING_BOX_UNIT = """\
+[Unit]
+Description=sing-box proxy service
+After=network-online.target
+Wants=network-online.target
+Before=docker.service cloudflared.service
+
+[Service]
+ExecStart={bin} run -c /etc/sing-box/active.json
+Restart=on-failure
+RestartSec=3s
+User=root
+
+[Install]
+WantedBy=multi-user.target
+"""
 PROBE_ACTIVE_PORT     = 7890   # port of the running sing-box instance
 PROBE_TEMP_PORT       = 17890  # temp port used when probing a single non-active proxy
 PROBE_TEMP_PORT_BASE  = 17900  # base of port pool for bulk probing (17900..17900+CONCURRENCY-1)
@@ -1211,6 +1228,22 @@ def cmd_tun(args):
     print(f"TUN mode {'enabled' if args.action == 'on' else 'disabled'}.")
 
 
+def _write_service_unit():
+    SING_BOX_SERVICE_PATH.write_text(SING_BOX_UNIT.format(bin=SING_BOX_BIN))
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "sing-box"], check=True)
+    print(f"Service file written: {SING_BOX_SERVICE_PATH}")
+    print("Ordering: After=network-online.target  Before=docker.service cloudflared.service")
+
+
+def cmd_service_update(args):
+    if not Path(SING_BOX_BIN).exists():
+        print(f"Error: {SING_BOX_BIN} not found — run 'proxyctl install' first.", file=sys.stderr)
+        sys.exit(1)
+    _write_service_unit()
+    print("sing-box service updated. Changes take effect on next boot (or 'proxyctl restart').")
+
+
 def cmd_install(args):
     import tarfile as _tarfile
     import tempfile
@@ -1252,21 +1285,7 @@ def cmd_install(args):
     Path("/etc/sing-box").mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    unit = (
-        "[Unit]\n"
-        "Description=sing-box proxy service\n"
-        "After=network.target\n\n"
-        "[Service]\n"
-        f"ExecStart={SING_BOX_BIN} run -c /etc/sing-box/active.json\n"
-        "Restart=on-failure\n"
-        "RestartSec=3s\n"
-        "User=root\n\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n"
-    )
-    Path("/etc/systemd/system/sing-box.service").write_text(unit)
-    subprocess.run(["systemctl", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "enable", "sing-box"], check=True)
+    _write_service_unit()
     print("sing-box service installed and enabled.")
     print("Run: proxyctl add <file.txt> to load proxies.")
 
@@ -1961,6 +1980,16 @@ def main():
             "/usr/local/bin/sing-box, and create + enable a systemd service unit."
         ),
     )
+    sub.add_parser(
+        "service-update",
+        help="rewrite systemd service file (After=network-online, Before=docker/cloudflared)",
+        description=(
+            "Overwrite /etc/systemd/system/sing-box.service with the current template\n"
+            "and reload systemd. Does not restart sing-box or re-download the binary.\n\n"
+            "Use this after 'proxyctl install' to apply the latest service unit without\n"
+            "reinstalling, or whenever docker/cloudflared ordering needs to be refreshed."
+        ),
+    )
 
     args = parser.parse_args()
     dispatch = {
@@ -1973,7 +2002,8 @@ def main():
         "start":   lambda a: service_action("start"),
         "stop":    cmd_stop,
         "restart": lambda a: service_action("restart"),
-        "logs": cmd_logs, "tun": cmd_tun, "sysproxy": cmd_sysproxy, "install": cmd_install,
+        "logs": cmd_logs, "tun": cmd_tun, "sysproxy": cmd_sysproxy,
+        "install": cmd_install, "service-update": cmd_service_update,
     }
     dispatch[args.command](args)
 
