@@ -1339,7 +1339,7 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
         elif marked_ids:
             footer = f" [{len(marked_ids)} marked]  Space: toggle  D: delete marked  Esc: clear  Q: quit"
         else:
-            footer = " ↑↓/jk: nav  Spc: mark  U: use  T: lat  A: lat-all  p: probe  P: probe-all  D: del  F: del FAIL  Q: quit"
+            footer = " ↑↓/jk: nav  Spc: mark  U: use  T: lat  A: lat-all  p: probe  B: probe-all  D: del  F: del FAIL  Q: quit"
         try:
             stdscr.addstr(h - 1, 0, _wcstrunc(footer, w - 1))
         except curses.error:
@@ -1577,7 +1577,7 @@ def _tui_main(stdscr):
                 proxies = lib.all()
                 status_msg = f" ✓ #{sel_pid} {msg}" if ok else f" ✗ #{sel_pid} FAIL: {msg}"
 
-        elif key == ord('P'):
+        elif key in (ord('b'), ord('B')):
             import queue as _queue
             total = len(proxies)
             _state = load_state()
