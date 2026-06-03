@@ -1487,7 +1487,7 @@ def _tui_main(stdscr):
                 done2 = threading.Event()
                 _utls = state.get("utls")
 
-                def _run_probe_temp(entry=sel_entry, utls=_utls, url=proxy_url):
+                def _run_probe_temp(entry=sel_entry["outbound"], utls=_utls, url=proxy_url):
                     result2[0] = _probe_via_temp_singbox(entry, utls=utls)
                     done2.set()
 
