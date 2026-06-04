@@ -24,7 +24,15 @@ try:
 except ImportError:
     requests = None  # type: ignore
 
-CONFIG_DIR = Path.home() / ".config" / "proxyctl"
+def _config_home() -> Path:
+    """Return the real user's home when running under sudo."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        import pwd
+        return Path(pwd.getpwnam(sudo_user).pw_dir)
+    return Path.home()
+
+CONFIG_DIR = _config_home() / ".config" / "proxyctl"
 PROXIES_FILE = CONFIG_DIR / "proxies.json"
 STATE_FILE = CONFIG_DIR / "state.json"
 SING_BOX_CONFIG = Path("/etc/sing-box/active.json")
