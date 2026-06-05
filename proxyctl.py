@@ -447,13 +447,27 @@ def generate_active_config(
         {"type": "mixed", "tag": "mixed-in", "listen": "::", "listen_port": 7892},
     ]
     if mode == "tun":
-        inbounds.append({
+        tun_inbound: dict = {
             "type": "tun",
             "tag": "tun-in",
             "address": ["172.19.0.1/30"],
             "auto_route": True,
             "strict_route": True,
-        })
+        }
+        # Exclude private subnets (LAN, loopback) so remote SSH management
+        # and local traffic bypass TUN. Also exclude the proxy server IP so
+        # sing-box can reach it directly without looping through the tunnel.
+        route_exclude = [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "fc00::/7",
+        ]
+        proxy_server = outbound.get("server", "")
+        if proxy_server and not proxy_server.startswith(("10.", "172.", "192.168.")):
+            route_exclude.append(f"{proxy_server}/32")
+        tun_inbound["route_exclude_address"] = route_exclude
+        inbounds.append(tun_inbound)
 
     if utls and outbound.get("type") in ("vless", "trojan", "vmess"):
         tls = outbound.setdefault("tls", {"enabled": True})
@@ -1037,7 +1051,21 @@ def cmd_status(args):
     print(f"SOCKS5 proxy: socks5://127.0.0.1:7891")
 
 
+def _check_not_tun(cmd: str):
+    """Print error and exit if current mode is TUN."""
+    state = load_state()
+    if state.get("mode") == "tun":
+        print(
+            f"Error: '{cmd}' is not available in TUN mode — all traffic is routed through "
+            "the proxy, making direct TCP tests meaningless and temp sing-box probes loop.\n"
+            "Run 'proxyctl tun off' first, run your tests, then re-enable TUN.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def cmd_test(args):
+    _check_not_tun("test")
     lib = ProxyLibrary(PROXIES_FILE).load()
     proxy = lib.get(args.id)
     if not proxy:
@@ -1055,6 +1083,7 @@ def cmd_test(args):
 
 
 def cmd_test_all(args):
+    _check_not_tun("test-all")
     lib = ProxyLibrary(PROXIES_FILE).load()
     proxies = lib.all()
     if not proxies:
@@ -1072,6 +1101,7 @@ def cmd_test_all(args):
 
 
 def cmd_probe_all(args):
+    _check_not_tun("probe-all")
     import queue as _queue
 
     lib = ProxyLibrary(PROXIES_FILE).load()
@@ -1518,6 +1548,9 @@ def _tui_main(stdscr):
             status_msg = f" ● Active: [{pid}] {_wcstrunc(entry.get('tag',''), 40)}"
 
         elif key in (ord('t'), ord('T')):
+            if state.get("mode") == "tun":
+                status_msg = " T/A unavailable in TUN mode — all traffic is routed through the proxy"
+                continue
             pid, entry = proxies[selected]
             host, port = entry.get("host", ""), entry.get("port", 0)
 
@@ -1641,6 +1674,9 @@ def _tui_main(stdscr):
                 status_msg = f" ✓ #{sel_pid} {msg}" if ok else f" ✗ #{sel_pid} FAIL: {msg}"
 
         elif key in (ord('b'), ord('B')):
+            if state.get("mode") == "tun":
+                status_msg = " B unavailable in TUN mode — temp sing-box processes would loop through the tunnel"
+                continue
             import queue as _queue
             total = len(proxies)
             _state = load_state()
@@ -1697,6 +1733,9 @@ def _tui_main(stdscr):
             status_msg = f" HTTP probe done: {ok_count}/{total} live"
 
         elif key in (ord('a'), ord('A')):
+            if state.get("mode") == "tun":
+                status_msg = " T/A unavailable in TUN mode — all traffic is routed through the proxy"
+                continue
             total = len(proxies)
             done_count = [0]
             count_lock = threading.Lock()

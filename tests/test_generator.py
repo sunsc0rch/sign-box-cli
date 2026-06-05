@@ -33,6 +33,12 @@ def test_tun_inbound_fields():
     assert tun["auto_route"] is True
     assert tun["address"] == ["172.19.0.1/30"]
     assert "sniff" not in tun  # moved to route rule action in sing-box 1.13
+    # private subnets and proxy server IP excluded from TUN
+    exclude = tun.get("route_exclude_address", [])
+    assert "10.0.0.0/8" in exclude
+    assert "192.168.0.0/16" in exclude
+    server = out.get("server", "")
+    assert f"{server}/32" in exclude
 
 
 def test_tun_mode_sniff_route_rule():
