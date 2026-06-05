@@ -450,10 +450,9 @@ def generate_active_config(
         inbounds.append({
             "type": "tun",
             "tag": "tun-in",
-            "inet4_address": "172.19.0.1/30",
+            "address": ["172.19.0.1/30"],
             "auto_route": True,
             "strict_route": True,
-            "sniff": True,
         })
 
     if utls and outbound.get("type") in ("vless", "trojan", "vmess"):
@@ -465,8 +464,12 @@ def generate_active_config(
         outbound.setdefault("packet_encoding", "xudp")
 
     route: dict = {"final": outbound["tag"]}
+    route_rules: list = []
+    if mode == "tun":
+        # sniff moved from inbound field to route rule action in sing-box 1.13
+        route_rules.append({"action": "sniff"})
     if bypass:
-        route_rules = [{"ip_is_private": True, "outbound": "direct"}]
+        route_rules.append({"ip_is_private": True, "outbound": "direct"})
         rule_sets = []
         for country in bypass:
             country = country.lower()
@@ -490,8 +493,9 @@ def generate_active_config(
                     "update_interval": "1d",
                 },
             ]
-        route["rules"] = route_rules
         route["rule_set"] = rule_sets
+    if route_rules:
+        route["rules"] = route_rules
 
     config: dict = {
         "log": {"level": "warn"},

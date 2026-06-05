@@ -31,7 +31,22 @@ def test_tun_inbound_fields():
     cfg = generate_active_config(out, mode="tun")
     tun = next(i for i in cfg["inbounds"] if i["type"] == "tun")
     assert tun["auto_route"] is True
-    assert tun["inet4_address"] == "172.19.0.1/30"
+    assert tun["address"] == ["172.19.0.1/30"]
+    assert "sniff" not in tun  # moved to route rule action in sing-box 1.13
+
+
+def test_tun_mode_sniff_route_rule():
+    out = parse_uri(VLESS_REALITY)
+    cfg = generate_active_config(out, mode="tun")
+    assert "rules" in cfg["route"]
+    assert {"action": "sniff"} in cfg["route"]["rules"]
+
+
+def test_socks_mode_no_sniff_rule():
+    out = parse_uri(VLESS_REALITY)
+    cfg = generate_active_config(out, mode="socks")
+    # socks mode has no sniff rule and no route rules by default
+    assert "rules" not in cfg["route"]
 
 
 def test_outbounds_contain_proxy_direct_block():
