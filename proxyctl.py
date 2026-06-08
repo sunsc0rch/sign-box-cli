@@ -1349,7 +1349,7 @@ def _wcstrunc(s: str, max_w: int) -> str:
     return ''.join(out)
 
 
-def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids):
+def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids, sort_by_live=False):
     import curses
     try:
         stdscr.erase()
@@ -1432,7 +1432,8 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
         elif marked_ids:
             footer = f" [{len(marked_ids)} marked]  Space: toggle  D: delete marked  Esc: clear  Q: quit"
         else:
-            footer = " ↑↓/jk: nav  Spc: mark  U: use  T: lat  A: lat-all  p: probe  B: probe-all  D: del  F: del FAIL  Q: quit"
+            sort_label = "S: sort✓" if not sort_by_live else "S: sort#"
+            footer = f" ↑↓/jk: nav  Spc: mark  U: use  T: lat  A: lat-all  p: probe  B: probe-all  {sort_label}  D: del  F: del FAIL  Q: quit"
         try:
             stdscr.addstr(h - 1, 0, _wcstrunc(footer, w - 1))
         except curses.error:
@@ -1486,8 +1487,22 @@ def _tui_main(stdscr):
             break
 
     scroll_off = 0
+    sort_by_live = False
     if curses.has_colors():
         curses.init_pair(2, curses.COLOR_YELLOW, -1)
+
+    def _apply_sort(lst: list) -> list:
+        if not sort_by_live:
+            return sorted(lst, key=lambda x: x[0])
+        # ✓ first, then · (not tested), then ✗
+        def _live_key(item):
+            v = item[1].get("live")
+            if v is True:   return 0
+            if v is None:   return 1
+            return 2
+        return sorted(lst, key=_live_key)
+
+    proxies = _apply_sort(proxies)
 
     while True:
         h, _ = stdscr.getmaxyx()
@@ -1498,7 +1513,7 @@ def _tui_main(stdscr):
         elif selected >= scroll_off + list_h:
             scroll_off = selected - list_h + 1
 
-        _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids)
+        _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids, sort_by_live)
         status_msg = ""
 
         key = stdscr.getch()
@@ -1800,6 +1815,19 @@ def _tui_main(stdscr):
                     status_msg = f" Deleted {removed} FAIL proxy(ies)"
                 else:
                     status_msg = " Cancelled"
+
+        elif key in (ord('s'), ord('S')):
+            sort_by_live = not sort_by_live
+            cur_pid = proxies[selected][0] if proxies else None
+            proxies = _apply_sort(ProxyLibrary(PROXIES_FILE).load().all())
+            # keep cursor on the same proxy after re-sort
+            if cur_pid is not None:
+                for i, (pid, _) in enumerate(proxies):
+                    if pid == cur_pid:
+                        selected = i
+                        break
+            label = "live-first (✓→·→✗)" if sort_by_live else "by ID"
+            status_msg = f" Sorted {label}"
 
         elif key in (ord('q'), ord('Q')):
             break
