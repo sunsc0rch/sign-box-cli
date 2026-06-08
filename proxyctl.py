@@ -1267,6 +1267,22 @@ def cmd_tun(args):
     os.replace(tmp, SING_BOX_CONFIG)
     state["mode"] = new_mode
     save_state(state)
+
+    if args.action == "on" and getattr(args, "patch", False):
+        patch_bin = "/usr/local/bin/singbox-tun-patch.sh"
+        if not Path(patch_bin).exists():
+            print(f"Warning: --patch specified but {patch_bin} not found — skipping.",
+                  file=sys.stderr)
+        else:
+            result = subprocess.run(
+                [sys.executable, patch_bin],
+                capture_output=True, text=True,
+            )
+            if result.stdout:
+                print(result.stdout.rstrip())
+            if result.stderr:
+                print(result.stderr.rstrip(), file=sys.stderr)
+
     service_action("restart")
     print(f"TUN mode {'enabled' if args.action == 'on' else 'disabled'}.")
 
@@ -2040,6 +2056,16 @@ def main():
         ),
     )
     p.add_argument("action", choices=["on", "off"], help="on: enable TUN, off: disable")
+    p.add_argument(
+        "--patch",
+        action="store_true",
+        default=False,
+        help=(
+            "After enabling TUN, run /usr/local/bin/singbox-tun-patch.sh to apply "
+            "fixes: gvisor stack, resolve hostnames in route_exclude_address, add "
+            "DNS server exclusions, set auto_detect_interface. Only valid with 'on'."
+        ),
+    )
 
     p = sub.add_parser(
         "sysproxy",
