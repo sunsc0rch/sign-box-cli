@@ -1560,7 +1560,7 @@ def _tui_main(stdscr):
             )
             _tui_suspend(stdscr, cmd_use, ns)
             state = load_state()
-            proxies = ProxyLibrary(PROXIES_FILE).load().all()
+            proxies = _apply_sort(ProxyLibrary(PROXIES_FILE).load().all())
             status_msg = f" ● Active: [{pid}] {_wcstrunc(entry.get('tag',''), 40)}"
 
         elif key in (ord('t'), ord('T')):
@@ -1622,7 +1622,7 @@ def _tui_main(stdscr):
                 if stopped:
                     state = load_state()
                 marked_ids.clear()
-                proxies = lib.all()
+                proxies = _apply_sort(lib.all())
                 selected = min(selected, max(0, len(proxies) - 1))
                 status_msg = f" Deleted {removed} proxy(ies)"
             else:
@@ -1659,7 +1659,7 @@ def _tui_main(stdscr):
                 ok, msg, _ = result[0]
                 lib = ProxyLibrary(PROXIES_FILE).load()
                 lib.set_live(sel_pid, ok)
-                proxies = lib.all()
+                proxies = _apply_sort(lib.all())
                 status_msg = f" ✓ #{sel_pid} {msg}" if ok else f" ✗ #{sel_pid} FAIL: {msg}"
             else:
                 proxy_url = f"http://127.0.0.1:{PROBE_TEMP_PORT}"
@@ -1686,7 +1686,7 @@ def _tui_main(stdscr):
                 ok, msg, _ = result2[0]
                 lib = ProxyLibrary(PROXIES_FILE).load()
                 lib.set_live(sel_pid, ok)
-                proxies = lib.all()
+                proxies = _apply_sort(lib.all())
                 status_msg = f" ✓ #{sel_pid} {msg}" if ok else f" ✗ #{sel_pid} FAIL: {msg}"
 
         elif key in (ord('b'), ord('B')):
@@ -1744,7 +1744,7 @@ def _tui_main(stdscr):
                 if e is not None:
                     e["live"] = ok
             lib.save()
-            proxies = lib.all()
+            proxies = _apply_sort(lib.all())
             ok_count = sum(1 for v in live_results.values() if v)
             status_msg = f" HTTP probe done: {ok_count}/{total} live"
 
@@ -1811,7 +1811,7 @@ def _tui_main(stdscr):
                     if stopped:
                         state = load_state()
                     marked_ids -= set(fail_ids)
-                    proxies = lib.all()
+                    proxies = _apply_sort(lib.all())
                     selected = min(selected, max(0, len(proxies) - 1))
                     status_msg = f" Deleted {removed} FAIL proxy(ies)"
                 else:
