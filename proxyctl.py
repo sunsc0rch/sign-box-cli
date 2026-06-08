@@ -384,6 +384,7 @@ _STATE_DEFAULTS: dict = {
     "mode": "socks",
     "dns": "tls://1.1.1.1",
     "utls": "chrome",
+    "sort_by_live": False,
 }
 
 def load_state() -> dict:
@@ -1487,7 +1488,7 @@ def _tui_main(stdscr):
             break
 
     scroll_off = 0
-    sort_by_live = False
+    sort_by_live = bool(state.get("sort_by_live", False))
     if curses.has_colors():
         curses.init_pair(2, curses.COLOR_YELLOW, -1)
 
@@ -1818,9 +1819,10 @@ def _tui_main(stdscr):
 
         elif key in (ord('s'), ord('S')):
             sort_by_live = not sort_by_live
+            state["sort_by_live"] = sort_by_live
+            save_state(state)
             cur_pid = proxies[selected][0] if proxies else None
             proxies = _apply_sort(ProxyLibrary(PROXIES_FILE).load().all())
-            # keep cursor on the same proxy after re-sort
             if cur_pid is not None:
                 for i, (pid, _) in enumerate(proxies):
                     if pid == cur_pid:
