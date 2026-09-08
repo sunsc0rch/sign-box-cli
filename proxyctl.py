@@ -1224,6 +1224,87 @@ def cmd_test_active(args):
         sys.exit(1)
 
 
+# ── Notify (Pushover) ────────────────────────────────────────────────────────
+
+NOTIFY_CONFIG_FILE = CONFIG_DIR / "notify.json"
+
+
+def _load_notify_config() -> Optional[dict]:
+    if not NOTIFY_CONFIG_FILE.exists():
+        return None
+    try:
+        cfg = json.loads(NOTIFY_CONFIG_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not cfg.get("pushover_token") or not cfg.get("pushover_user_key"):
+        return None
+    return cfg
+
+
+def _save_notify_config(token: str, user_key: str):
+    NOTIFY_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    NOTIFY_CONFIG_FILE.write_text(
+        json.dumps({"pushover_token": token, "pushover_user_key": user_key}, indent=2)
+    )
+    os.chmod(NOTIFY_CONFIG_FILE, 0o600)
+
+
+def _send_pushover_notification(message: str, title: str = "proxyctl watchdog",
+                                 priority: int = 1) -> bool:
+    """Best-effort push notification via Pushover. Returns False (never raises) if
+    unconfigured or the request fails — a broken notifier must never block the
+    watchdog's own self-stop.
+
+    Explicitly bypasses http_proxy/https_proxy (ProxyHandler({})): this fires
+    exactly when the local sing-box proxy is dead, so routing through it would
+    make the alert fail right when it's needed most.
+    """
+    cfg = _load_notify_config()
+    if cfg is None:
+        return False
+    try:
+        data = urllib.parse.urlencode({
+            "token": cfg["pushover_token"],
+            "user": cfg["pushover_user_key"],
+            "message": message,
+            "title": title,
+            "priority": priority,
+        }).encode()
+        req = urllib.request.Request("https://api.pushover.net/1/messages.json", data=data)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+def cmd_notify_set(args):
+    import getpass
+    token = getpass.getpass("Pushover API token: ").strip()
+    user_key = input("Pushover user key: ").strip()
+    if not token or not user_key:
+        print("Error: both token and user key are required.", file=sys.stderr)
+        sys.exit(1)
+    _save_notify_config(token, user_key)
+    print(f"Saved to {NOTIFY_CONFIG_FILE} (mode 600).")
+
+
+def cmd_notify_test(args):
+    if _load_notify_config() is None:
+        print("Error: notify not configured — run 'proxyctl notify set' first.", file=sys.stderr)
+        sys.exit(1)
+    ok = _send_pushover_notification("Test notification from proxyctl.", title="proxyctl test")
+    if ok:
+        print("Sent.")
+    else:
+        print("Error: failed to send — check token/user key.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_notify(args):
+    {"set": cmd_notify_set, "test": cmd_notify_test}[args.action](args)
+
+
 # ── Watchdog ─────────────────────────────────────────────────────────────────
 
 WATCHDOG_INTERVAL_DEFAULT = 7200
@@ -1312,6 +1393,18 @@ def _watchdog_record_status(result: dict):
         save_state(state)
 
 
+def _notify_no_candidates_message() -> str:
+    state = load_state()
+    active_id = state.get("active_id")
+    return (
+        f"Host: {socket.gethostname()}\n"
+        f"All proxies are down — watchdog is stopping itself.\n"
+        f"Last active proxy: [{active_id}]\n"
+        f"Load a fresh batch: proxyctl add <file.txt> && proxyctl probe-all\n"
+        f"Then restart: proxyctl watchdog install (or 'W' in the TUI)."
+    )
+
+
 def _watchdog_loop(interval: float, fail_threshold: int, stop_event: Optional[threading.Event] = None) -> dict:
     """Run watchdog checks every `interval` seconds until stop_event fires or no
     working proxy can be found. Returns the terminal result dict."""
@@ -1325,6 +1418,11 @@ def _watchdog_loop(interval: float, fail_threshold: int, stop_event: Optional[th
         print(f"[watchdog] {result['action']}: {result['message']}")
         _watchdog_record_status(result)
         if result["action"] == "stopped_no_candidates":
+            try:
+                _send_pushover_notification(_notify_no_candidates_message(),
+                                             title="proxyctl watchdog — all proxies down")
+            except Exception:
+                pass
             return result
         _watchdog_wait(interval, stop_event)
 
@@ -2511,6 +2609,20 @@ def main():
         help=f"consecutive failures before failover (default: {WATCHDOG_FAIL_THRESHOLD_DEFAULT})",
     )
 
+    p = sub.add_parser(
+        "notify",
+        help="configure Pushover alerts for when the watchdog runs out of proxies",
+        description=(
+            "Pushover push notification sent once, right before the watchdog stops\n"
+            "itself because no working proxy could be found (see 'proxyctl watchdog').\n"
+            "Credentials are stored in ~/.config/proxyctl/notify.json (mode 600) —\n"
+            "never as CLI args or in the systemd unit, which are world-readable.\n\n"
+            "  set:  prompts for the Pushover API token and user key, saves them.\n"
+            "  test: sends a test notification with the saved credentials."
+        ),
+    )
+    p.add_argument("action", choices=["set", "test"])
+
     args = parser.parse_args()
     dispatch = {
         "compact": cmd_compact,
@@ -2524,7 +2636,7 @@ def main():
         "restart": lambda a: service_action("restart"),
         "logs": cmd_logs, "tun": cmd_tun, "sysproxy": cmd_sysproxy,
         "install": cmd_install, "service-update": cmd_service_update,
-        "watchdog": cmd_watchdog,
+        "watchdog": cmd_watchdog, "notify": cmd_notify,
     }
     dispatch[args.command](args)
 

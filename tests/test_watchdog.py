@@ -2,6 +2,7 @@ import json
 import os
 import threading
 import time
+import urllib.request
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -794,3 +795,213 @@ def test_watchdog_check_no_memory_growth_over_many_iterations(tmp_library, monke
         f"RSS grew by {growth_kb} KiB over 300 watchdog checks "
         f"(baseline={baseline_kb} KiB, final={final_kb} KiB) — possible leak"
     )
+
+
+# ── notify config ────────────────────────────────────────────────────────────
+
+def test_save_and_load_notify_config_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+
+    proxyctl._save_notify_config("tok123", "user456")
+    cfg = proxyctl._load_notify_config()
+
+    assert cfg == {"pushover_token": "tok123", "pushover_user_key": "user456"}
+
+
+def test_save_notify_config_sets_restrictive_permissions(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+
+    proxyctl._save_notify_config("tok123", "user456")
+
+    mode = (tmp_path / "notify.json").stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_load_notify_config_missing_file_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "does-not-exist.json")
+
+    assert proxyctl._load_notify_config() is None
+
+
+def test_load_notify_config_incomplete_returns_none(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "notify.json"
+    cfg_path.write_text(json.dumps({"pushover_token": "only-token"}))
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", cfg_path)
+
+    assert proxyctl._load_notify_config() is None
+
+
+def test_load_notify_config_corrupt_json_returns_none(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "notify.json"
+    cfg_path.write_text("{not json")
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", cfg_path)
+
+    assert proxyctl._load_notify_config() is None
+
+
+# ── pushover send ────────────────────────────────────────────────────────────
+
+def test_send_pushover_skips_when_not_configured(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "does-not-exist.json")
+
+    with patch("urllib.request.build_opener") as mock_build_opener:
+        ok = proxyctl._send_pushover_notification("hello")
+
+    assert ok is False
+    mock_build_opener.assert_not_called()
+
+
+def _mock_opener(status=200):
+    mock_resp = MagicMock()
+    mock_resp.status = status
+    mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    opener = MagicMock()
+    opener.open.return_value = mock_resp
+    return opener
+
+
+def test_send_pushover_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+    proxyctl._save_notify_config("tok123", "user456")
+    opener = _mock_opener()
+
+    with patch("urllib.request.build_opener", return_value=opener):
+        ok = proxyctl._send_pushover_notification("all proxies dead", title="alert")
+
+    assert ok is True
+    req = opener.open.call_args.args[0]
+    assert req.full_url == "https://api.pushover.net/1/messages.json"
+    body = req.data.decode()
+    assert "token=tok123" in body
+    assert "user=user456" in body
+    assert "all+proxies+dead" in body or "all%20proxies%20dead" in body
+
+
+def test_send_pushover_bypasses_local_proxy_env(tmp_path, monkeypatch):
+    """The notification must reach Pushover even when http_proxy/https_proxy point
+    at the local sing-box instance — which is exactly what's down when this fires.
+    """
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+    proxyctl._save_notify_config("tok123", "user456")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:7890")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:7890")
+    opener = _mock_opener()
+
+    with patch("urllib.request.build_opener", return_value=opener) as mock_build_opener:
+        proxyctl._send_pushover_notification("hello")
+
+    handler_arg = mock_build_opener.call_args.args[0]
+    assert isinstance(handler_arg, urllib.request.ProxyHandler)
+    assert handler_arg.proxies == {}
+
+
+def test_send_pushover_network_failure_returns_false(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+    proxyctl._save_notify_config("tok123", "user456")
+
+    with patch("urllib.request.build_opener", side_effect=OSError("network unreachable")):
+        ok = proxyctl._send_pushover_notification("hello")
+
+    assert ok is False
+
+
+# ── CLI: proxyctl notify ─────────────────────────────────────────────────────
+
+def test_notify_set_saves_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+
+    with patch("getpass.getpass", return_value="tok123"), \
+         patch("builtins.input", return_value="user456"):
+        proxyctl.cmd_notify_set(_make_args())
+
+    cfg = proxyctl._load_notify_config()
+    assert cfg == {"pushover_token": "tok123", "pushover_user_key": "user456"}
+
+
+def test_notify_set_rejects_empty_values(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+
+    with patch("getpass.getpass", return_value=""), \
+         patch("builtins.input", return_value="user456"):
+        with pytest.raises(SystemExit):
+            proxyctl.cmd_notify_set(_make_args())
+
+    assert proxyctl._load_notify_config() is None
+
+
+def test_notify_test_fails_when_not_configured(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "does-not-exist.json")
+
+    with pytest.raises(SystemExit):
+        proxyctl.cmd_notify_test(_make_args())
+
+
+def test_notify_test_sends_and_reports_success(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+    proxyctl._save_notify_config("tok123", "user456")
+
+    with patch("proxyctl._send_pushover_notification", return_value=True) as mock_send:
+        proxyctl.cmd_notify_test(_make_args())
+
+    assert "Sent" in capsys.readouterr().out
+    mock_send.assert_called_once()
+
+
+def test_notify_test_reports_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+    proxyctl._save_notify_config("tok123", "user456")
+
+    with patch("proxyctl._send_pushover_notification", return_value=False):
+        with pytest.raises(SystemExit):
+            proxyctl.cmd_notify_test(_make_args())
+
+
+# ── watchdog self-stop notification hook ────────────────────────────────────
+
+def test_watchdog_loop_notifies_on_no_candidates(tmp_library, monkeypatch, tmp_path):
+    _populated_lib(tmp_library, monkeypatch, [VLESS_A])
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+    proxyctl._save_notify_config("tok123", "user456")
+    stop_event = threading.Event()
+
+    with patch("proxyctl._watchdog_check",
+               return_value={"action": "stopped_no_candidates", "fail_count": 3,
+                             "message": "no working proxies available", "switched_to": None}), \
+         patch("proxyctl._watchdog_record_status"), \
+         patch("proxyctl._send_pushover_notification", return_value=True) as mock_send:
+        proxyctl._watchdog_loop(7200, 3, stop_event=stop_event)
+
+    mock_send.assert_called_once()
+    sent_message = mock_send.call_args.args[0]
+    assert "proxy" in sent_message.lower()
+
+
+def test_watchdog_loop_does_not_notify_on_normal_stop(tmp_library, monkeypatch, tmp_path):
+    _populated_lib(tmp_library, monkeypatch, [VLESS_A])
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+    proxyctl._save_notify_config("tok123", "user456")
+    stop_event = threading.Event()
+    stop_event.set()
+
+    with patch("proxyctl._send_pushover_notification") as mock_send:
+        proxyctl._watchdog_loop(7200, 3, stop_event=stop_event)
+
+    mock_send.assert_not_called()
+
+
+def test_watchdog_loop_survives_notification_failure(tmp_library, monkeypatch, tmp_path):
+    """A broken/unconfigured notifier must never prevent the self-stop from
+    completing and returning control to the caller."""
+    _populated_lib(tmp_library, monkeypatch, [VLESS_A])
+    monkeypatch.setattr(proxyctl, "NOTIFY_CONFIG_FILE", tmp_path / "notify.json")
+    stop_event = threading.Event()
+
+    with patch("proxyctl._watchdog_check",
+               return_value={"action": "stopped_no_candidates", "fail_count": 3,
+                             "message": "no working proxies available", "switched_to": None}), \
+         patch("proxyctl._watchdog_record_status"), \
+         patch("proxyctl._send_pushover_notification", side_effect=RuntimeError("boom")):
+        result = proxyctl._watchdog_loop(7200, 3, stop_event=stop_event)
+
+    assert result["action"] == "stopped_no_candidates"
