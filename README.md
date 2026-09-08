@@ -223,6 +223,8 @@ proxyctl watchdog status                      # активен ли юнит + �
 
 Юнит запускается как `User=root`, но `proxyctl watchdog install` подставляет в него `Environment=HOME=<домашний каталог вызывающего>`, чтобы watchdog читал те же `proxies.json`/`state.json`/lock-файл, что и интерактивный TUI — не `/root/.config/proxyctl`. Запускайте `proxyctl watchdog install` тем же способом, что и `proxyctl install` (например, `ssh user@server 'sudo proxyctl watchdog install'`, где `sudo` сохраняет `$SUDO_USER`), а не из root-логина — иначе домашний каталог определится неверно.
 
+Юнит **не** объявляет `Requires=sing-box.service` (только `After=` для порядка загрузки) — watchdog сам перезапускает `sing-box.service` при каждом failover, и `Requires=` заставил бы systemd каскадом останавливать сам watchdog в этот момент (проверено вживую: без этого watchdog убивал себя SIGKILL'ом на каждом переключении). По той же причине юнит содержит `Environment=PYTHONUNBUFFERED=1` — иначе под systemd (не-tty) Python буферизует `print()` блоками, и `journalctl` показывает записи `[watchdog] ...` с задержкой в часы вместо реального времени. Повторный `proxyctl watchdog install` с новыми `--interval`/`--fail-threshold` делает `systemctl restart` (а не `start`), чтобы уже запущенный процесс реально подхватил новые значения, а не продолжил жить со старыми.
+
 **В TUI** — клавиша `W` включает/выключает встроенный watchdog-поток на время сессии (без systemd, не персистится между запусками TUI). Лок-файл (`~/.config/proxyctl/watchdog.lock`) не даёт запуститься двум watchdog'ам одновременно — если systemd-юнит уже работает, `W` в TUI откажет с понятным сообщением вместо того, чтобы вступить в конфликт за переключение прокси.
 
 ### TUN-режим
@@ -304,4 +306,4 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-159 тестов покрывают парсеры URI, библиотеку прокси, генератор конфигов (bypass/DNS/uTLS/Clash API), CLI-команды, system proxy и watchdog (выбор кандидата, порог неудач, self-stop, graceful shutdown, lock-файл, конкурентная запись, soak-тест на утечки памяти).
+162 теста покрывают парсеры URI, библиотеку прокси, генератор конфигов (bypass/DNS/uTLS/Clash API), CLI-команды, system proxy и watchdog (выбор кандидата, порог неудач, self-stop, graceful shutdown, lock-файл, конкурентная запись, soak-тест на утечки памяти). Watchdog дополнительно проверен вживую на реальном сервере: настоящее переключение под нагрузкой (заблокированный сервер прокси), self-stop при отсутствии рабочих кандидатов, и корректная работа под systemd (общий конфиг с TUI, отсутствие самоубийства при failover, читаемые логи в journalctl).
