@@ -192,7 +192,7 @@ def test_use_writes_config_and_restarts(tmp_library, monkeypatch, tmp_path):
     assert config_path.exists()
     cfg = json.loads(config_path.read_text())
     assert cfg["route"]["final"] is not None
-    mock_sa.assert_called_with("restart")
+    mock_sa.assert_called_with("restart", silent=True)
 
 
 def test_use_tun_mode_config(tmp_library, monkeypatch, tmp_path):

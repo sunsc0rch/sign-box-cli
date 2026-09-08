@@ -3,10 +3,12 @@
 
 import argparse
 import base64
+import fcntl
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -58,6 +60,12 @@ PROBE_ACTIVE_PORT     = 7890   # port of the running sing-box instance
 PROBE_TEMP_PORT       = 17890  # temp port used when probing a single non-active proxy
 PROBE_TEMP_PORT_BASE  = 17900  # base of port pool for bulk probing (17900..17900+CONCURRENCY-1)
 PROBE_BULK_CONCURRENCY = 8     # max simultaneous temp sing-box processes during probe-all
+WATCHDOG_PROBE_PORT   = 17898  # dedicated port for failover candidate reprobes — kept
+                                # distinct from PROBE_TEMP_PORT (17890, used by the 'p'/'T'
+                                # TUI keys) and the PROBE_TEMP_PORT_BASE pool (17900-17907,
+                                # used by probe-all/'B'), so a watchdog failover scan running
+                                # in the background doesn't collide with a probe the user
+                                # triggers manually and spuriously fail a live candidate.
 PROBE_BULK_TIMEOUT    = 8.0    # seconds per proxy during probe-all
 
 
@@ -321,6 +329,15 @@ def build_library_entry(uri: str, outbound: dict) -> dict:
 
 # ── Proxy Library ────────────────────────────────────────────────────────────
 
+# Serializes writes to proxies.json/state.json against the in-process watchdog
+# thread (TUI 'W' mode runs it alongside the TUI main thread — without this, a
+# probe/delete/use in the main thread racing a watchdog check/failover could
+# interleave writes or silently drop one side's update). Does not protect against
+# a *separate* proxyctl process (e.g. the systemd watchdog) writing concurrently —
+# that cross-process race predates this feature and is out of scope here.
+_DATA_LOCK = threading.RLock()
+
+
 class ProxyLibrary:
     def __init__(self, path: Path = PROXIES_FILE):
         self.path = path
@@ -332,8 +349,9 @@ class ProxyLibrary:
         return self
 
     def save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._data, indent=2, ensure_ascii=False))
+        with _DATA_LOCK:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self._data, indent=2, ensure_ascii=False))
 
     def add(self, entry: dict) -> int:
         existing = {int(k) for k in self._data["proxies"]}
@@ -398,8 +416,9 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    with _DATA_LOCK:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
 # ── Config Generator ─────────────────────────────────────────────────────────
@@ -863,20 +882,21 @@ def _set_env_proxy(enable: bool) -> bool:
     return r.returncode == 0
 
 
-def set_sysproxy(enable: bool) -> None:
+def set_sysproxy(enable: bool, silent: bool = False) -> None:
     gnome_ok = _set_gnome_proxy(enable)
     env_ok = _set_env_proxy(enable)
     word = "enabled" if enable else "disabled"
-    if gnome_ok:
-        print(f"  GNOME proxy: {word}")
-    if env_ok:
-        print(f"  /etc/environment: {word}")
-    if not gnome_ok and not env_ok:
-        print(
-            "  Warning: could not set system proxy "
-            "(gsettings unavailable or no write access to /etc/environment)",
-            file=sys.stderr,
-        )
+    if not silent:
+        if gnome_ok:
+            print(f"  GNOME proxy: {word}")
+        if env_ok:
+            print(f"  /etc/environment: {word}")
+        if not gnome_ok and not env_ok:
+            print(
+                "  Warning: could not set system proxy "
+                "(gsettings unavailable or no write access to /etc/environment)",
+                file=sys.stderr,
+            )
     state = load_state()
     state["sysproxy"] = enable
     save_state(state)
@@ -945,17 +965,21 @@ def _resolve_use_settings(args, state: dict) -> tuple:
     return bypass, dns, clash_api, utls
 
 
-def cmd_use(args):
-    state = load_state()
+def _switch_active(pid: int, mode: str, bypass, dns, clash_api, utls, state: dict):
+    """Write sing-box config for pid, restart the service, enable sysproxy. No output.
+
+    Returns (ok, reason, payload):
+      reason: "ok" | "not_found" | "start_failed" | "timeout"
+      payload is the proxy dict on success, a short message otherwise.
+
+    Mutates and saves `state` on success (active_id/mode/bypass/dns/clash_api/utls).
+    """
     lib = ProxyLibrary(PROXIES_FILE).load()
-    proxy = lib.get(args.id)
+    proxy = lib.get(pid)
     if not proxy:
-        print(f"Error: proxy {args.id} not found.", file=sys.stderr)
-        sys.exit(1)
+        return False, "not_found", f"proxy {pid} not found"
 
-    bypass, dns, clash_api, utls = _resolve_use_settings(args, state)
-
-    config = generate_active_config(proxy["outbound"], mode=args.mode,
+    config = generate_active_config(proxy["outbound"], mode=mode,
                                     bypass=bypass, dns=dns, clash_api=clash_api, utls=utls)
     SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     tmp = SING_BOX_CONFIG.with_suffix(".tmp")
@@ -963,8 +987,8 @@ def cmd_use(args):
     os.replace(tmp, SING_BOX_CONFIG)
 
     state.update({
-        "active_id": args.id,
-        "mode": args.mode,
+        "active_id": pid,
+        "mode": mode,
         "bypass": bypass,
         "dns": dns,
         "clash_api": clash_api,
@@ -972,7 +996,7 @@ def cmd_use(args):
     })
     save_state(state)
 
-    service_action("restart")
+    service_action("restart", silent=True)
     deadline = time.time() + 5
     while time.time() < deadline:
         result = subprocess.run(
@@ -982,15 +1006,31 @@ def cmd_use(args):
         if status == "active":
             break
         if status in ("failed", "inactive"):
-            print("sing-box failed to start. Last logs:")
-            subprocess.run(["journalctl", "-u", "sing-box", "-n", "10", "--no-pager"])
-            sys.exit(1)
+            return False, "start_failed", "sing-box failed to start"
         time.sleep(0.5)
     else:
-        print("sing-box did not become active within 5s. Last logs:")
+        return False, "timeout", "sing-box did not become active within 5s"
+
+    set_sysproxy(True, silent=True)
+    return True, "ok", proxy
+
+
+def cmd_use(args):
+    state = load_state()
+    bypass, dns, clash_api, utls = _resolve_use_settings(args, state)
+
+    ok, reason, payload = _switch_active(args.id, args.mode, bypass, dns, clash_api, utls, state)
+
+    if reason == "not_found":
+        print(f"Error: proxy {args.id} not found.", file=sys.stderr)
+        sys.exit(1)
+
+    if not ok:
+        print(f"{payload}. Last logs:")
         subprocess.run(["journalctl", "-u", "sing-box", "-n", "10", "--no-pager"])
         sys.exit(1)
 
+    proxy = payload
     summary_parts = [
         f"Active: [{args.id}] {proxy['tag']}",
         f"{proxy['protocol']} | {proxy['host']}:{proxy['port']}",
@@ -1006,7 +1046,6 @@ def cmd_use(args):
         summary_parts.append(f"utls={utls}")
     print(" | ".join(summary_parts))
     print("Setting system proxy...")
-    set_sysproxy(True)
 
 
 def cmd_stop(args):
@@ -1183,6 +1222,313 @@ def cmd_test_active(args):
     else:
         print(f"FAIL: {msg}", file=sys.stderr)
         sys.exit(1)
+
+
+# ── Watchdog ─────────────────────────────────────────────────────────────────
+
+WATCHDOG_INTERVAL_DEFAULT = 7200
+WATCHDOG_FAIL_THRESHOLD_DEFAULT = 3
+WATCHDOG_LOCK_FILE = CONFIG_DIR / "watchdog.lock"
+WATCHDOG_SERVICE_PATH = Path("/etc/systemd/system/sing-box-watchdog.service")
+# Environment=HOME is required: systemd gives a User=root service no HOME, so
+# Path.home() (used by _config_home()) would resolve to /root instead of the
+# deploying user's home — silently pointing proxies.json/state.json/watchdog.lock
+# at a different directory than the interactive TUI/CLI use.
+WATCHDOG_UNIT = """\
+[Unit]
+Description=proxyctl auto-failover watchdog
+After=sing-box.service
+# Ordering only, deliberately no hard dependency directive on sing-box.service:
+# the watchdog itself restarts that service on every failover, and a hard
+# dependency would make systemd propagate that restart into a stop of this
+# unit too, killing the watchdog mid-switch.
+
+[Service]
+Environment=HOME={home}
+# Without this, stdout is a non-tty pipe under systemd and Python fully
+# block-buffers print() — journalctl won't show '[watchdog] ...' lines until the
+# buffer fills or the process exits (confirmed live: could be a day+ delay at the
+# default 2h interval).
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/local/bin/proxyctl watchdog run --interval {interval} --fail-threshold {fail_threshold}
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=60s
+User=root
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def _watchdog_acquire_lock():
+    """Try to take the watchdog lock. Returns an open file handle on success, None if
+    another watchdog instance already holds it (TUI thread or systemd unit)."""
+    WATCHDOG_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Open without truncating (O_CREAT|O_RDWR, no O_TRUNC) — a losing contender must
+    # not wipe the winner's PID, or "which pid holds the lock" becomes unanswerable
+    # right when it's needed for diagnostics.
+    fd = os.open(WATCHDOG_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+    fh = os.fdopen(fd, "r+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    fh.seek(0)
+    fh.truncate()
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+def _watchdog_release_lock(fh):
+    if fh is None:
+        return
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
+def _watchdog_wait(interval: float, stop_event: threading.Event, step: float = 1.0):
+    """Sleep up to `interval` seconds in small steps, waking early if stop_event fires —
+    so a SIGTERM/SIGINT (or a TUI toggle-off) is honored within ~`step` seconds instead
+    of blocking for the whole interval."""
+    elapsed = 0.0
+    while elapsed < interval and not stop_event.is_set():
+        time.sleep(min(step, interval - elapsed))
+        elapsed += step
+
+
+def _watchdog_record_status(result: dict):
+    with _DATA_LOCK:
+        state = load_state()
+        state["watchdog_last_check"] = time.time()
+        state["watchdog_last_action"] = result["action"]
+        state["watchdog_last_message"] = result["message"]
+        if result["action"] == "switched":
+            state["watchdog_last_switch"] = {"to": result["switched_to"], "at": state["watchdog_last_check"]}
+        save_state(state)
+
+
+def _watchdog_loop(interval: float, fail_threshold: int, stop_event: Optional[threading.Event] = None) -> dict:
+    """Run watchdog checks every `interval` seconds until stop_event fires or no
+    working proxy can be found. Returns the terminal result dict."""
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    fail_count = 0
+    while not stop_event.is_set():
+        result = _watchdog_check(fail_count, fail_threshold=fail_threshold)
+        fail_count = result["fail_count"]
+        print(f"[watchdog] {result['action']}: {result['message']}")
+        _watchdog_record_status(result)
+        if result["action"] == "stopped_no_candidates":
+            return result
+        _watchdog_wait(interval, stop_event)
+
+    return {"action": "stopped_signal", "fail_count": fail_count,
+            "message": "stopped", "switched_to": None}
+
+
+def _pick_failover_candidate(lib: "ProxyLibrary", exclude_id, utls: Optional[str],
+                              timeout: float = 15.0):
+    """Find a replacement proxy: live=True candidates (by id, excluding exclude_id),
+    live-reconfirmed via a temp sing-box probe. Returns (pid, entry) of the first
+    one that actually passes, or None if nothing works.
+    """
+    candidates = sorted(
+        ((pid, entry) for pid, entry in lib.all()
+         if pid != exclude_id and entry.get("live") is True),
+        key=lambda x: x[0],
+    )
+    for pid, entry in candidates:
+        ok, _msg, _ms = _probe_via_temp_singbox(entry.get("outbound", {}), utls=utls, timeout=timeout,
+                                                  port=WATCHDOG_PROBE_PORT)
+        if ok:
+            return pid, entry
+    return None
+
+
+def _watchdog_check(fail_count: int, fail_threshold: int = WATCHDOG_FAIL_THRESHOLD_DEFAULT,
+                     timeout: float = 15.0) -> dict:
+    """Run one watchdog check cycle against the currently active proxy.
+
+    Reloads state/library from disk (so it reflects any external changes, e.g. a
+    manual 'proxyctl use' between checks). Does not sleep — caller owns the interval.
+
+    Returns a dict: {"action": ..., "fail_count": int, "message": str, "switched_to": pid|None}
+    action is one of: "no_active", "skipped_tun", "ok", "fail_below_threshold",
+                       "switched", "stopped_no_candidates".
+    """
+    state = load_state()
+    active_id = state.get("active_id")
+    if active_id is None:
+        return {"action": "no_active", "fail_count": 0,
+                "message": "no active proxy", "switched_to": None}
+
+    if state.get("mode") == "tun":
+        return {"action": "skipped_tun", "fail_count": fail_count,
+                "message": "skipped — TUN mode", "switched_to": None}
+
+    ok, msg, _ms = http_probe(f"http://127.0.0.1:{PROBE_ACTIVE_PORT}", timeout=timeout)
+    with _DATA_LOCK:
+        lib = ProxyLibrary(PROXIES_FILE).load()
+        lib.set_live(active_id, ok)
+
+    if ok:
+        return {"action": "ok", "fail_count": 0, "message": msg, "switched_to": None}
+
+    fail_count += 1
+    if fail_count < fail_threshold:
+        return {"action": "fail_below_threshold", "fail_count": fail_count,
+                "message": f"probe failed ({fail_count}/{fail_threshold}): {msg}",
+                "switched_to": None}
+
+    utls = state.get("utls")
+    candidate = _pick_failover_candidate(lib, exclude_id=active_id, utls=utls, timeout=timeout)
+    if candidate is None:
+        return {"action": "stopped_no_candidates", "fail_count": fail_count,
+                "message": "no working proxies available", "switched_to": None}
+
+    pid, _entry = candidate
+    sw_ok, sw_reason, sw_payload = _switch_active(
+        pid, state.get("mode", "socks"), state.get("bypass"), state.get("dns"),
+        state.get("clash_api"), state.get("utls"), state,
+    )
+    if not sw_ok:
+        return {"action": "fail_below_threshold", "fail_count": fail_count,
+                "message": f"failover to [{pid}] failed: {sw_payload}", "switched_to": None}
+
+    return {"action": "switched", "fail_count": 0,
+            "message": f"switched to [{pid}] {sw_payload['tag']}", "switched_to": pid}
+
+
+def _watchdog_write_service_unit(interval: float, fail_threshold: int):
+    WATCHDOG_SERVICE_PATH.write_text(
+        WATCHDOG_UNIT.format(interval=interval, fail_threshold=fail_threshold, home=_config_home())
+    )
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "sing-box-watchdog"], check=True)
+
+
+def cmd_watchdog_run(args):
+    lock_fh = _watchdog_acquire_lock()
+    if lock_fh is None:
+        print("Error: watchdog is already running (lock held).", file=sys.stderr)
+        sys.exit(1)
+
+    stop_event = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_a: stop_event.set())
+    signal.signal(signal.SIGINT, lambda *_a: stop_event.set())
+
+    print(f"watchdog started (interval={args.interval}s, fail_threshold={args.fail_threshold})")
+    try:
+        result = _watchdog_loop(args.interval, args.fail_threshold, stop_event=stop_event)
+    finally:
+        _watchdog_release_lock(lock_fh)
+    print(f"watchdog stopped: {result['message']}")
+
+
+def cmd_watchdog_install(args):
+    if not Path(SING_BOX_BIN).exists():
+        print(f"Error: {SING_BOX_BIN} not found — run 'proxyctl install' first.", file=sys.stderr)
+        sys.exit(1)
+    if load_state().get("active_id") is None:
+        print("Warning: no active proxy — the watchdog will start but has nothing to "
+              "monitor until you run 'proxyctl use <id>'.", file=sys.stderr)
+    _watchdog_write_service_unit(args.interval, args.fail_threshold)
+    # 'restart', not 'start': 'systemctl start' on an already-active unit is a no-op,
+    # so re-running install with new --interval/--fail-threshold would rewrite the
+    # unit file but leave an already-running process on its old settings. 'restart'
+    # works correctly whether the unit was running or not.
+    subprocess.run(["systemctl", "restart", "sing-box-watchdog"], check=True)
+    print(f"Service file written: {WATCHDOG_SERVICE_PATH}")
+    print(f"sing-box-watchdog installed and started "
+          f"(interval={args.interval}s, fail_threshold={args.fail_threshold}).")
+
+
+def cmd_watchdog_stop(args):
+    result = subprocess.run(
+        ["systemctl", "stop", "sing-box-watchdog"], capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print("sing-box-watchdog stopped.")
+    else:
+        print("sing-box-watchdog is not installed or already stopped.")
+
+
+def cmd_watchdog_delete(args):
+    subprocess.run(["systemctl", "stop", "sing-box-watchdog"], capture_output=True, text=True)
+    subprocess.run(["systemctl", "disable", "sing-box-watchdog"], capture_output=True, text=True)
+    if WATCHDOG_SERVICE_PATH.exists():
+        WATCHDOG_SERVICE_PATH.unlink()
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
+    if WATCHDOG_LOCK_FILE.exists():
+        try:
+            WATCHDOG_LOCK_FILE.unlink()
+        except OSError:
+            pass
+    print("sing-box-watchdog service removed.")
+
+
+def cmd_watchdog_status(args):
+    result = subprocess.run(
+        ["systemctl", "is-active", "sing-box-watchdog"], capture_output=True, text=True
+    )
+    svc_status = result.stdout.strip() or "not-installed"
+    print(f"Service:      {svc_status}")
+
+    state = load_state()
+    last_check = state.get("watchdog_last_check")
+    if last_check is None:
+        print("Last check:   never")
+        return
+    age = time.time() - last_check
+    print(f"Last check:   {age:.0f}s ago — {state.get('watchdog_last_action')}: "
+          f"{state.get('watchdog_last_message')}")
+    last_switch = state.get("watchdog_last_switch")
+    if last_switch:
+        print(f"Last switch:  -> [{last_switch['to']}]")
+
+
+def _tui_start_watchdog(interval: float = WATCHDOG_INTERVAL_DEFAULT,
+                         fail_threshold: int = WATCHDOG_FAIL_THRESHOLD_DEFAULT):
+    """Start an in-process watchdog thread for the current TUI session.
+
+    Returns a handle dict {'lock_fh', 'stop_event', 'thread'}, or None if the lock is
+    already held (a systemd sing-box-watchdog unit or another TUI session owns it).
+    """
+    lock_fh = _watchdog_acquire_lock()
+    if lock_fh is None:
+        return None
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_watchdog_loop, args=(interval, fail_threshold),
+        kwargs={"stop_event": stop_event}, daemon=True,
+    )
+    thread.start()
+    return {"lock_fh": lock_fh, "stop_event": stop_event, "thread": thread}
+
+
+def _tui_stop_watchdog(handle: Optional[dict], timeout: float = 2.0):
+    """Stop a watchdog handle from _tui_start_watchdog: signal, join, release lock."""
+    if handle is None:
+        return
+    handle["stop_event"].set()
+    handle["thread"].join(timeout=timeout)
+    _watchdog_release_lock(handle["lock_fh"])
+
+
+def cmd_watchdog(args):
+    {
+        "run": cmd_watchdog_run,
+        "install": cmd_watchdog_install,
+        "stop": cmd_watchdog_stop,
+        "delete": cmd_watchdog_delete,
+        "status": cmd_watchdog_status,
+    }[args.action](args)
 
 
 def _parse_id_args(raw_ids: list) -> list:
@@ -1366,7 +1712,8 @@ def _wcstrunc(s: str, max_w: int) -> str:
     return ''.join(out)
 
 
-def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids, sort_by_live=False):
+def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids,
+              sort_by_live=False, watchdog_on=False):
     import curses
     try:
         stdscr.erase()
@@ -1381,8 +1728,9 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
             svc = "?"
 
         mark_info = f"  |  {len(marked_ids)} marked" if marked_ids else ""
+        wd_info = "  |  watchdog: on" if watchdog_on else ""
         header = (f" proxyctl  |  sing-box: {svc}  |  mode: {state.get('mode','socks')}"
-                  f"  |  {len(proxies)} proxies{mark_info}")
+                  f"  |  {len(proxies)} proxies{wd_info}{mark_info}")
         stdscr.addstr(0, 0, _wcstrunc(header, w - 1), curses.A_BOLD)
         stdscr.addstr(1, 0, "─" * (w - 1))
 
@@ -1450,7 +1798,8 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
             footer = f" [{len(marked_ids)} marked]  Space: toggle  D: delete marked  Esc: clear  Q: quit"
         else:
             sort_label = "S: sort✓" if not sort_by_live else "S: sort#"
-            footer = f" ↑↓/jk: nav  Spc: mark  U: use  T: lat  A: lat-all  p: probe  B: probe-all  {sort_label}  D: del  F: del FAIL  Q: quit"
+            wd_label = "W: watchdog-off" if watchdog_on else "W: watchdog"
+            footer = f" ↑↓/jk: nav  Spc: mark  U: use  T: lat  A: lat-all  p: probe  B: probe-all  {sort_label}  {wd_label}  D: del  F: del FAIL  Q: quit"
         try:
             stdscr.addstr(h - 1, 0, _wcstrunc(footer, w - 1))
         except curses.error:
@@ -1505,6 +1854,7 @@ def _tui_main(stdscr):
 
     scroll_off = 0
     sort_by_live = bool(state.get("sort_by_live", False))
+    watchdog_handle = None
     if curses.has_colors():
         curses.init_pair(2, curses.COLOR_YELLOW, -1)
 
@@ -1530,10 +1880,26 @@ def _tui_main(stdscr):
         elif selected >= scroll_off + list_h:
             scroll_off = selected - list_h + 1
 
-        _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids, sort_by_live)
+        _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids,
+                  sort_by_live, watchdog_on=watchdog_handle is not None)
         status_msg = ""
 
+        # Poll for changes the watchdog thread may have made in the background
+        # (switched proxy, updated live status, or stopped itself). -1 == no
+        # keypress within the 1s timeout set below while the watchdog is on.
         key = stdscr.getch()
+
+        if key == -1:
+            if watchdog_handle is not None:
+                state = load_state()
+                proxies = _apply_sort(ProxyLibrary(PROXIES_FILE).load().all())
+                if not watchdog_handle["thread"].is_alive():
+                    # watchdog stopped itself (e.g. no working proxies left)
+                    status_msg = f" Watchdog stopped: {state.get('watchdog_last_message', '')}"
+                    _tui_stop_watchdog(watchdog_handle)
+                    watchdog_handle = None
+                    stdscr.timeout(-1)
+            continue
 
         if not proxies:
             if key in (ord('q'), ord('Q'), 27):
@@ -1847,8 +2213,26 @@ def _tui_main(stdscr):
             label = "live-first (✓→·→✗)" if sort_by_live else "by ID"
             status_msg = f" Sorted {label}"
 
+        elif key in (ord('w'), ord('W')):
+            if watchdog_handle is not None:
+                _tui_stop_watchdog(watchdog_handle)
+                watchdog_handle = None
+                stdscr.timeout(-1)
+                status_msg = " Watchdog disabled"
+            else:
+                watchdog_handle = _tui_start_watchdog()
+                if watchdog_handle is None:
+                    status_msg = " Watchdog already running elsewhere (systemd unit or another session)"
+                else:
+                    stdscr.timeout(1000)
+                    status_msg = (f" Watchdog enabled (every {WATCHDOG_INTERVAL_DEFAULT}s, "
+                                  f"threshold {WATCHDOG_FAIL_THRESHOLD_DEFAULT})")
+
         elif key in (ord('q'), ord('Q')):
             break
+
+    if watchdog_handle is not None:
+        _tui_stop_watchdog(watchdog_handle)
 
 
 def cmd_tui():
@@ -2098,6 +2482,35 @@ def main():
         ),
     )
 
+    p = sub.add_parser(
+        "watchdog",
+        help="auto-failover: switch to a working proxy when the active one goes stale",
+        description=(
+            "Periodically probes the active proxy. After --fail-threshold consecutive\n"
+            "failures, switches to the first live proxy in the library that also passes\n"
+            "a fresh reprobe. If none work, the watchdog stops itself (exit 0, no restart)\n"
+            "instead of looping forever against dead proxies.\n\n"
+            "  run:     foreground check loop — SIGTERM/SIGINT stop it gracefully.\n"
+            "           This is what the systemd unit below runs.\n"
+            "  install: write + enable + start sing-box-watchdog.service (systemd), so it\n"
+            "           survives SSH session disconnects and restarts on crash.\n"
+            "  stop:    gracefully stop the systemd unit (SIGTERM).\n"
+            "  delete:  stop + disable + remove the systemd unit.\n"
+            "  status:  show whether the unit is active and the last check result.\n\n"
+            "Also available inside the TUI via the 'W' key (in-process, no systemd needed)."
+        ),
+    )
+    p.add_argument("action", choices=["run", "install", "stop", "delete", "status"])
+    p.add_argument(
+        "--interval", type=float, default=WATCHDOG_INTERVAL_DEFAULT, metavar="SEC",
+        help=f"seconds between checks (default: {WATCHDOG_INTERVAL_DEFAULT})",
+    )
+    p.add_argument(
+        "--fail-threshold", dest="fail_threshold", type=int,
+        default=WATCHDOG_FAIL_THRESHOLD_DEFAULT, metavar="N",
+        help=f"consecutive failures before failover (default: {WATCHDOG_FAIL_THRESHOLD_DEFAULT})",
+    )
+
     args = parser.parse_args()
     dispatch = {
         "compact": cmd_compact,
@@ -2111,6 +2524,7 @@ def main():
         "restart": lambda a: service_action("restart"),
         "logs": cmd_logs, "tun": cmd_tun, "sysproxy": cmd_sysproxy,
         "install": cmd_install, "service-update": cmd_service_update,
+        "watchdog": cmd_watchdog,
     }
     dispatch[args.command](args)
 
