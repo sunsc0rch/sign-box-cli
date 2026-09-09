@@ -1810,6 +1810,44 @@ def _wcstrunc(s: str, max_w: int) -> str:
     return ''.join(out)
 
 
+def _wrap_footer_hints(hints: list, width: int) -> list:
+    """Pack hint strings into lines of at most `width` display columns each,
+    never splitting a single hint across two lines (a too-long lone hint is
+    truncated rather than split). Used so the footer keybinding legend degrades
+    to multiple lines in narrow terminals instead of being cut off."""
+    lines = []
+    cur = ""
+    for hint in hints:
+        piece = f"  {hint}" if cur else f" {hint}"
+        if cur and _wcswidth(cur) + _wcswidth(piece) > width:
+            lines.append(cur)
+            cur = f" {hint}"
+        else:
+            cur += piece
+    if cur:
+        lines.append(cur)
+    return [_wcstrunc(l, width) for l in lines] or [""]
+
+
+def _tui_footer_lines(status_msg: str, marked_ids: set, sort_by_live: bool,
+                       watchdog_on: bool, width: int) -> list:
+    """Compute the footer's display lines for the current UI state. Shared between
+    the main loop (to size the proxy list above it) and the drawing code (to
+    render it), so the two stay in sync."""
+    if status_msg:
+        return [_wcstrunc(status_msg, width)]
+    if marked_ids:
+        hints = [f"[{len(marked_ids)} marked]", "Space: toggle", "D: delete marked",
+                 "Esc: clear", "Q: quit"]
+    else:
+        sort_label = "S: sort✓" if not sort_by_live else "S: sort#"
+        wd_label = "W: watchdog-off" if watchdog_on else "W: watchdog"
+        hints = ["↑↓/jk: nav", "Spc: mark", "U: use", "T: lat", "A: lat-all",
+                 "p: probe", "B: probe-all", sort_label, wd_label,
+                 "D: del", "F: del FAIL", "Q: quit"]
+    return _wrap_footer_hints(hints, width)
+
+
 def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_msg, marked_ids,
               sort_by_live=False, watchdog_on=False):
     import curses
@@ -1832,7 +1870,8 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
         stdscr.addstr(0, 0, _wcstrunc(header, w - 1), curses.A_BOLD)
         stdscr.addstr(1, 0, "─" * (w - 1))
 
-        list_h = h - 4
+        footer_lines = _tui_footer_lines(status_msg, marked_ids, sort_by_live, watchdog_on, w - 1)
+        list_h = h - 3 - len(footer_lines)
         id_w, proto_w, country_w, lat_w, live_w, host_w = 5, 8, 4, 6, 2, 23
         tag_w = max(8, w - id_w - proto_w - country_w - lat_w - live_w - host_w - 13)
 
@@ -1889,19 +1928,12 @@ def _tui_draw(stdscr, proxies, selected, scroll_off, state, latencies, status_ms
             except curses.error:
                 pass
 
-        stdscr.addstr(h - 2, 0, "─" * (w - 1))
-        if status_msg:
-            footer = status_msg
-        elif marked_ids:
-            footer = f" [{len(marked_ids)} marked]  Space: toggle  D: delete marked  Esc: clear  Q: quit"
-        else:
-            sort_label = "S: sort✓" if not sort_by_live else "S: sort#"
-            wd_label = "W: watchdog-off" if watchdog_on else "W: watchdog"
-            footer = f" ↑↓/jk: nav  Spc: mark  U: use  T: lat  A: lat-all  p: probe  B: probe-all  {sort_label}  {wd_label}  D: del  F: del FAIL  Q: quit"
-        try:
-            stdscr.addstr(h - 1, 0, _wcstrunc(footer, w - 1))
-        except curses.error:
-            pass
+        stdscr.addstr(h - 1 - len(footer_lines), 0, "─" * (w - 1))
+        for i, line in enumerate(footer_lines):
+            try:
+                stdscr.addstr(h - len(footer_lines) + i, 0, line)
+            except curses.error:
+                pass
 
         stdscr.refresh()
     except curses.error:
@@ -1970,8 +2002,10 @@ def _tui_main(stdscr):
     proxies = _apply_sort(proxies)
 
     while True:
-        h, _ = stdscr.getmaxyx()
-        list_h = h - 4
+        h, w = stdscr.getmaxyx()
+        footer_lines = _tui_footer_lines(status_msg, marked_ids, sort_by_live,
+                                          watchdog_handle is not None, w - 1)
+        list_h = h - 3 - len(footer_lines)
 
         if selected < scroll_off:
             scroll_off = selected
