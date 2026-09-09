@@ -1,4 +1,5 @@
 import json
+import shutil
 import pytest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
@@ -483,3 +484,86 @@ def test_use_enables_sysproxy(tmp_library, monkeypatch, tmp_path):
         mock_run.return_value = MagicMock(stdout="active\n", returncode=0)
         proxyctl.cmd_use(_make_args(id=1, mode="socks", bypass=None, dns=None, clash_api=None, utls=None))
     mock_gnome.assert_called_once_with(True)
+
+
+# ── install ──────────────────────────────────────────────────────────────────
+
+def _fake_release_tarball(tmp_path):
+    """Build a real .tar.gz containing a fake sing-box binary, mirroring the
+    upstream GitHub release layout (binary nested one directory deep)."""
+    import tarfile
+    src_dir = tmp_path / "archive_src"
+    src_dir.mkdir()
+    binpath = src_dir / "sing-box"
+    binpath.write_bytes(b"#!/bin/sh\necho fake sing-box\n")
+    tar_path = tmp_path / "sing-box-1.0.0-linux-amd64.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        tf.add(binpath, arcname="sing-box-1.0.0-linux-amd64/sing-box")
+    return tar_path
+
+
+def _patch_install_network(tar_path):
+    release_json = {
+        "assets": [{
+            "name": "sing-box-1.0.0-linux-amd64.tar.gz",
+            "browser_download_url": "https://example.invalid/sing-box.tar.gz",
+        }]
+    }
+
+    def _fake_urlopen(url):
+        m = MagicMock()
+        m.__enter__ = MagicMock(return_value=m)
+        m.__exit__ = MagicMock(return_value=False)
+        m.read.return_value = json.dumps(release_json).encode()
+        return m
+
+    def _fake_urlretrieve(url, dest):
+        shutil.copy(tar_path, dest)
+
+    return (
+        patch("urllib.request.urlopen", side_effect=_fake_urlopen),
+        patch("urllib.request.urlretrieve", side_effect=_fake_urlretrieve),
+    )
+
+
+def test_cmd_install_extracts_binary(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "SING_BOX_BIN", str(tmp_path / "sing-box"))
+    monkeypatch.setattr(proxyctl, "CONFIG_DIR", tmp_path / "cfg")
+    monkeypatch.setattr(proxyctl, "SING_BOX_CONFIG", tmp_path / "etc-sing-box" / "active.json")
+    monkeypatch.setattr(proxyctl, "SING_BOX_SERVICE_PATH", tmp_path / "sing-box.service")
+    tar_path = _fake_release_tarball(tmp_path)
+    p_urlopen, p_urlretrieve = _patch_install_network(tar_path)
+
+    with p_urlopen, p_urlretrieve, patch("subprocess.run") as mock_run:
+        proxyctl.cmd_install(_make_args())
+
+    install_calls = [c for c in mock_run.call_args_list if c.args[0][0] == "install"]
+    assert install_calls, "expected an 'install' subprocess call to place the sing-box binary"
+
+
+def test_cmd_install_works_on_python_without_extract_filter_kwarg(tmp_path, monkeypatch):
+    """Python < 3.12 doesn't support TarFile.extract(filter=...) (added in 3.12,
+    PEP 706) — confirmed live deploying to a Debian 12 / Python 3.11.2 server,
+    where cmd_install crashed with 'unexpected keyword argument filter'.
+    """
+    import tarfile
+    monkeypatch.setattr(proxyctl, "SING_BOX_BIN", str(tmp_path / "sing-box"))
+    monkeypatch.setattr(proxyctl, "CONFIG_DIR", tmp_path / "cfg")
+    monkeypatch.setattr(proxyctl, "SING_BOX_CONFIG", tmp_path / "etc-sing-box" / "active.json")
+    monkeypatch.setattr(proxyctl, "SING_BOX_SERVICE_PATH", tmp_path / "sing-box.service")
+    tar_path = _fake_release_tarball(tmp_path)
+    p_urlopen, p_urlretrieve = _patch_install_network(tar_path)
+
+    real_extract = tarfile.TarFile.extract
+
+    def _extract_pre_312(self, member, path="", set_attrs=True, *, numeric_owner=False, **kwargs):
+        if "filter" in kwargs:
+            raise TypeError("extract() got an unexpected keyword argument 'filter'")
+        return real_extract(self, member, path, set_attrs, numeric_owner=numeric_owner)
+
+    with p_urlopen, p_urlretrieve, patch("subprocess.run") as mock_run, \
+         patch.object(tarfile.TarFile, "extract", _extract_pre_312):
+        proxyctl.cmd_install(_make_args())  # must not raise TypeError
+
+    install_calls = [c for c in mock_run.call_args_list if c.args[0][0] == "install"]
+    assert install_calls

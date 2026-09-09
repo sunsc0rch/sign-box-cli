@@ -1776,7 +1776,13 @@ def cmd_install(args):
                 if m.name.endswith("/sing-box") or m.name == "sing-box"
             )
             member.name = "sing-box"
-            tf.extract(member, tmpdir, filter="data")
+            # filter="data" (PEP 706) only exists on Python 3.12+; older
+            # interpreters (still within this project's stated 3.8+ support,
+            # and what Debian 12 ships as of this writing) reject the kwarg.
+            try:
+                tf.extract(member, tmpdir, filter="data")
+            except TypeError:
+                tf.extract(member, tmpdir)
 
         subprocess.run(
             ["install", "-m", "755", os.path.join(tmpdir, "sing-box"), SING_BOX_BIN],
@@ -1785,7 +1791,7 @@ def cmd_install(args):
 
     print(f"Installed: {SING_BOX_BIN}")
 
-    Path("/etc/sing-box").mkdir(parents=True, exist_ok=True)
+    SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
     _write_service_unit()
