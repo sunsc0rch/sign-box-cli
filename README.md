@@ -24,6 +24,24 @@
 - Ubuntu 20.04+ с systemd
 - `requests` (опционально, для `test-active`)
 
+### Где ещё это в теории работает
+
+Ubuntu упомянута как основная цель, но по факту `proxyctl` не завязан именно на неё — он завязан на конкретные Linux-механизмы (`systemctl`, `/etc/environment`, `gsettings`, TUN-интерфейсы). Ниже — честный разбор, что реально работает "из коробки", а что потребует правок, на основе фактических зависимостей в коде.
+
+**Работает без изменений:**
+- **Любой systemd-дистрибутив с GNOME** — Debian, Fedora Workstation, Pop!_OS, Linux Mint, Zorin и т.д. Ничего специфичного для Ubuntu в коде нет — GNOME-интеграция идёт через `gsettings`, который есть на любом GNOME-окружении, не только на Ubuntu.
+- **Любой systemd-дистрибутив без GNOME (headless/сервер)** — Debian minimal, Fedora Server, Arch, CentOS/RHEL/Rocky, openSUSE. `sysproxy`/`gsettings`-часть аккуратно деградирует (`shutil.which("gsettings")` → просто использует `/etc/environment`, без падений и ошибок), всё остальное — TUN, watchdog как systemd-сервис, TUI — работает как есть.
+- **Raspberry Pi OS / Ubuntu Server ARM / Armbian** — код архитектурно-независим, но `proxyctl install` качает только `linux-amd64`-релиз sing-box с GitHub — на ARM автозагрузка бинарника не найдёт подходящий asset. Обходится вручную: положить `arm64`/`armv7`-сборку sing-box в `/usr/local/bin/sing-box` самому, дальше всё работает.
+
+**Работает с оговорками:**
+- **WSL2 (Ubuntu/Debian под Windows)** — работает, если в WSL включён systemd (`[boot] systemd=true` в `/etc/wsl.conf`, доступно в современных сборках WSL2). GNOME-окружения нет, поэтому `sysproxy` ограничится `/etc/environment`. Поведение TUN-режима под виртуализированным сетевым стеком WSL2 не проверялось.
+- **Linux без systemd** (Alpine/OpenRC, Void Linux) — команды `install`, `start/stop/restart`, `watchdog install/stop/delete` дёргают `systemctl` напрямую и не заработают. Но `proxyctl watchdog run` — это обычный foreground-цикл без каких-либо systemd-зависимостей, его можно супервизировать через OpenRC/runit/supervisord вручную; TUI и остальные команды, не трогающие сервис, не затронуты.
+- **Docker/LXC-контейнер** — сам `proxyctl` (TUI, библиотека, watchdog `run`) прекрасно работает в контейнере. Для TUN-режима нужны `--cap-add=NET_ADMIN --device /dev/net/tun`. `watchdog install` (через `systemctl`) актуален только если внутри контейнера реально работает systemd (не типичный случай) — иначе супервизировать `watchdog run` штатным init-механизмом контейнера.
+
+**Не работает без портирования:**
+- **macOS** — sing-box сам по себе поддерживает macOS, и `curses` (используется в TUI) есть в stdlib и там тоже. Но весь service/sysproxy-слой `proxyctl` — Linux-специфичный: `systemctl` (нет в macOS, там `launchd`), `gsettings` (нет, там `networksetup`), `/etc/environment` (не тот механизм). Нужна отдельная реализация этого слоя под launchd-plist + `networksetup`.
+- **Windows (нативно, не WSL)** — нет `systemctl`, нет `/etc/environment`, нет `gsettings`, модуль `curses` не входит в стандартную поставку Python на Windows (нужен сторонний `windows-curses`), TUN использует другой драйвер (`wintun` вместо Linux `tun`). По сути — полноценный порт, а не правка конфигурации.
+
 ## Установка
 
 ```bash
