@@ -1748,11 +1748,14 @@ def cmd_service_update(args):
 
 
 def _fix_config_dir_ownership():
-    """'sudo proxyctl install' resolves CONFIG_DIR to the invoking user's home via
-    SUDO_USER (correct path), but creates it while running as root — leaving the
-    directory root-owned and locking the user out of their own config without
-    sudo on every later command. Chown it back to the invoking user when we can
-    tell who that is (SUDO_UID/SUDO_GID, set by sudo alongside SUDO_USER).
+    """'sudo proxyctl install' resolves CONFIG_DIR and SING_BOX_CONFIG.parent
+    (/etc/sing-box) to paths the invoking user is meant to own — CONFIG_DIR via
+    SUDO_USER, and /etc/sing-box because 'proxyctl use' writes active.json
+    directly (without sudo) so the systemd-managed sing-box service (User=root)
+    can read it. But both get created while this process is running as root,
+    leaving them root-owned and locking the user out without sudo on every
+    later command. Chown them back to the invoking user when we can tell who
+    that is (SUDO_UID/SUDO_GID, set by sudo alongside SUDO_USER).
     """
     if os.geteuid() != 0:
         return
@@ -1760,10 +1763,11 @@ def _fix_config_dir_ownership():
     sudo_gid = os.environ.get("SUDO_GID")
     if sudo_uid is None or sudo_gid is None:
         return
-    try:
-        os.chown(CONFIG_DIR, int(sudo_uid), int(sudo_gid))
-    except OSError:
-        pass
+    for path in (CONFIG_DIR, SING_BOX_CONFIG.parent):
+        try:
+            os.chown(path, int(sudo_uid), int(sudo_gid))
+        except OSError:
+            pass
 
 
 def cmd_install(args):

@@ -562,6 +562,7 @@ def test_cmd_install_fixes_config_dir_ownership_under_sudo(tmp_path, monkeypatch
         proxyctl.cmd_install(_make_args())
 
     mock_chown.assert_any_call(proxyctl.CONFIG_DIR, 1234, 1234)
+    mock_chown.assert_any_call(proxyctl.SING_BOX_CONFIG.parent, 1234, 1234)
 
 
 def test_cmd_install_skips_chown_when_not_root(tmp_path, monkeypatch):
