@@ -44,16 +44,28 @@ Ubuntu упомянута как основная цель, но по факту
 
 ## Установка
 
-```bash
-# Скопировать скрипт на сервер
-scp proxyctl.py user@server:/usr/local/bin/proxyctl
-ssh user@server 'chmod +x /usr/local/bin/proxyctl'
+Полностью автоматическая — один SSH-вызов, без ручных доводок после:
 
-# Установить sing-box и настроить systemd
-ssh user@server 'sudo proxyctl install'
+```bash
+ssh user@server 'curl -fsSL https://raw.githubusercontent.com/sunsc0rch/sign-box-cli/master/proxyctl.py \
+  | sudo tee /usr/local/bin/proxyctl >/dev/null && sudo chmod +x /usr/local/bin/proxyctl \
+  && sudo proxyctl install'
 ```
 
-`proxyctl install` скачивает последний релиз sing-box с GitHub, устанавливает его в `/usr/local/bin/sing-box` и создаёт службу systemd.
+Или через `scp`, если сервер без прямого доступа к GitHub:
+
+```bash
+scp proxyctl.py user@server:/usr/local/bin/proxyctl
+ssh user@server 'chmod +x /usr/local/bin/proxyctl && sudo proxyctl install'
+```
+
+`proxyctl install`:
+- скачивает последний релиз sing-box с GitHub, ставит в `/usr/local/bin/sing-box`
+- создаёт и включает systemd-юнит `sing-box.service`
+- чинит владельца `~/.config/proxyctl` и `/etc/sing-box` — они резолвятся в домашний каталог вызывающего пользователя (через `$SUDO_USER`), но создаются под root, если это не поправить, пользователь потом не сможет работать с proxyctl без sudo
+- выдаёт вызывающему пользователю **узкий** passwordless sudo (`/etc/sudoers.d/proxyctl`) — только на `systemctl {start,stop,restart,enable,disable} sing-box*`/`daemon-reload`, никакого полного root-доступа; правило валидируется через `visudo -c` перед установкой, при ошибке синтаксиса ничего не трогается. Отключить: `proxyctl install --no-sudoers`.
+
+Все шаги идемпотентны — повторный `sudo proxyctl install` (например, для обновления sing-box) сам всё перепроверяет и чинит, а не только при первом запуске. Единственное, что нельзя автоматизировать — сам факт первого SSH-подключения и ввод sudo-пароля.
 
 ## Использование
 
@@ -337,4 +349,4 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-179 тестов покрывают парсеры URI, библиотеку прокси, генератор конфигов (bypass/DNS/uTLS/Clash API), CLI-команды, system proxy, watchdog (выбор кандидата, порог неудач, self-stop, graceful shutdown, lock-файл, конкурентная запись, soak-тест на утечки памяти) и Pushover-уведомления. Watchdog дополнительно проверен вживую на реальном сервере: настоящее переключение под нагрузкой (заблокированный сервер прокси), self-stop при отсутствии рабочих кандидатов, и корректная работа под systemd (общий конфиг с TUI, отсутствие самоубийства при failover, читаемые логи в journalctl).
+199 тестов покрывают парсеры URI, библиотеку прокси, генератор конфигов (bypass/DNS/uTLS/Clash API), CLI-команды, system proxy, установку (кросс-версийная поддержка Python, починка владельца конфига, автоматизация passwordless sudo), watchdog (выбор кандидата, порог неудач, self-stop, graceful shutdown, lock-файл, конкурентная запись, soak-тест на утечки памяти) и Pushover-уведомления. Развёртывание и watchdog дополнительно проверены вживую на двух независимых серверах (Ubuntu 20.04 и Debian 12): настоящее переключение под нагрузкой, self-stop при отсутствии рабочих кандидатов, корректная работа под systemd, и полный `proxyctl install` с нуля на чистой машине.

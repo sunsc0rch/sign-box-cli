@@ -535,7 +535,7 @@ def test_cmd_install_extracts_binary(tmp_path, monkeypatch):
     p_urlopen, p_urlretrieve = _patch_install_network(tar_path)
 
     with p_urlopen, p_urlretrieve, patch("subprocess.run") as mock_run:
-        proxyctl.cmd_install(_make_args())
+        proxyctl.cmd_install(_make_args(no_sudoers=True))
 
     install_calls = [c for c in mock_run.call_args_list if c.args[0][0] == "install"]
     assert install_calls, "expected an 'install' subprocess call to place the sing-box binary"
@@ -559,7 +559,7 @@ def test_cmd_install_fixes_config_dir_ownership_under_sudo(tmp_path, monkeypatch
 
     with p_urlopen, p_urlretrieve, patch("subprocess.run"), \
          patch("os.chown") as mock_chown:
-        proxyctl.cmd_install(_make_args())
+        proxyctl.cmd_install(_make_args(no_sudoers=True))
 
     mock_chown.assert_any_call(proxyctl.CONFIG_DIR, 1234, 1234)
     mock_chown.assert_any_call(proxyctl.SING_BOX_CONFIG.parent, 1234, 1234)
@@ -576,7 +576,7 @@ def test_cmd_install_skips_chown_when_not_root(tmp_path, monkeypatch):
 
     with p_urlopen, p_urlretrieve, patch("subprocess.run"), \
          patch("os.chown") as mock_chown:
-        proxyctl.cmd_install(_make_args())
+        proxyctl.cmd_install(_make_args(no_sudoers=True))
 
     mock_chown.assert_not_called()
 
@@ -603,7 +603,84 @@ def test_cmd_install_works_on_python_without_extract_filter_kwarg(tmp_path, monk
 
     with p_urlopen, p_urlretrieve, patch("subprocess.run") as mock_run, \
          patch.object(tarfile.TarFile, "extract", _extract_pre_312):
-        proxyctl.cmd_install(_make_args())  # must not raise TypeError
+        proxyctl.cmd_install(_make_args(no_sudoers=True))  # must not raise TypeError
 
     install_calls = [c for c in mock_run.call_args_list if c.args[0][0] == "install"]
     assert install_calls
+
+
+# ── passwordless sudo automation ─────────────────────────────────────────────
+
+def test_ensure_passwordless_sudo_skips_when_not_root(monkeypatch):
+    monkeypatch.setattr(proxyctl.os, "geteuid", lambda: 1000)
+    monkeypatch.setenv("SUDO_USER", "john")
+    with patch("subprocess.run") as mock_run:
+        proxyctl._ensure_passwordless_sudo()
+    mock_run.assert_not_called()
+
+
+def test_ensure_passwordless_sudo_skips_when_no_sudo_user(monkeypatch):
+    monkeypatch.setattr(proxyctl.os, "geteuid", lambda: 0)
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    with patch("subprocess.run") as mock_run:
+        proxyctl._ensure_passwordless_sudo()
+    mock_run.assert_not_called()
+
+
+def test_ensure_passwordless_sudo_skips_when_flag_set(monkeypatch):
+    monkeypatch.setattr(proxyctl.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "john")
+    with patch("subprocess.run") as mock_run:
+        proxyctl._ensure_passwordless_sudo(skip=True)
+    mock_run.assert_not_called()
+
+
+def test_ensure_passwordless_sudo_installs_after_validation(monkeypatch, capsys):
+    monkeypatch.setattr(proxyctl.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "john")
+    monkeypatch.setattr(proxyctl.shutil, "which", lambda name: "/usr/sbin/visudo")
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[0] == "visudo":
+            return MagicMock(returncode=0, stderr="")
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=_fake_run) as mock_run:
+        proxyctl._ensure_passwordless_sudo()
+
+    visudo_calls = [c for c in mock_run.call_args_list if c.args[0][0] == "visudo"]
+    install_calls = [c for c in mock_run.call_args_list if c.args[0][0] == "install"]
+    assert visudo_calls
+    assert install_calls
+    assert str(proxyctl.SUDOERS_PATH) in install_calls[0].args[0]
+    assert "john" in capsys.readouterr().out
+
+
+def test_ensure_passwordless_sudo_skips_install_on_validation_failure(monkeypatch, capsys):
+    monkeypatch.setattr(proxyctl.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "john")
+    monkeypatch.setattr(proxyctl.shutil, "which", lambda name: "/usr/sbin/visudo")
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[0] == "visudo":
+            return MagicMock(returncode=1, stderr="syntax error")
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=_fake_run) as mock_run:
+        proxyctl._ensure_passwordless_sudo()
+
+    install_calls = [c for c in mock_run.call_args_list if c.args[0][0] == "install"]
+    assert not install_calls
+    assert "valid" in capsys.readouterr().err.lower() or "syntax" in capsys.readouterr().err.lower()
+
+
+def test_ensure_passwordless_sudo_skips_when_visudo_missing(monkeypatch, capsys):
+    monkeypatch.setattr(proxyctl.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "john")
+    monkeypatch.setattr(proxyctl.shutil, "which", lambda name: None)
+
+    with patch("subprocess.run") as mock_run:
+        proxyctl._ensure_passwordless_sudo()
+
+    mock_run.assert_not_called()
+    assert "visudo" in capsys.readouterr().err.lower()

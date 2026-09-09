@@ -1776,6 +1776,58 @@ def _fix_config_dir_ownership():
             pass
 
 
+SUDOERS_PATH = Path("/etc/sudoers.d/proxyctl")
+SUDOERS_RULE_TEMPLATE = """\
+# Managed by 'proxyctl install' — lets {user} manage the sing-box /
+# sing-box-watchdog systemd units without a sudo password, without granting
+# broader root access. Remove this file (or re-run with --no-sudoers) to revert.
+{user} ALL=(root) NOPASSWD: /usr/bin/systemctl start sing-box, /usr/bin/systemctl stop sing-box, /usr/bin/systemctl restart sing-box, /usr/bin/systemctl enable sing-box, /usr/bin/systemctl start sing-box-watchdog, /usr/bin/systemctl stop sing-box-watchdog, /usr/bin/systemctl restart sing-box-watchdog, /usr/bin/systemctl enable sing-box-watchdog, /usr/bin/systemctl disable sing-box-watchdog, /usr/bin/systemctl daemon-reload
+"""
+
+
+def _ensure_passwordless_sudo(skip: bool = False):
+    """Grant the invoking (pre-sudo) user passwordless sudo for exactly the
+    systemctl commands proxyctl needs — so 'proxyctl use'/'watchdog install' etc.
+    work without a password prompt afterward, without handing out full root.
+
+    Only acts when actually running under sudo (geteuid()==0 with SUDO_USER
+    set) — a bare root login has no "other user" to grant this to. The
+    generated rule is validated with 'visudo -c' before being installed;
+    anything invalid is discarded rather than risking a broken /etc/sudoers.d.
+    """
+    if skip or os.geteuid() != 0:
+        return
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user:
+        return
+    if not shutil.which("visudo"):
+        print("Warning: visudo not found — skipping passwordless-sudo setup "
+              "for systemctl (you'll be prompted for a password on 'proxyctl use' etc).",
+              file=sys.stderr)
+        return
+
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(prefix="proxyctl_sudoers_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(SUDOERS_RULE_TEMPLATE.format(user=sudo_user))
+        result = subprocess.run(["visudo", "-c", "-f", tmp_path], capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Warning: generated sudoers rule failed validation, skipping:\n{result.stderr.strip()}",
+                  file=sys.stderr)
+            return
+        subprocess.run(
+            ["install", "-m", "440", "-o", "root", "-g", "root", tmp_path, str(SUDOERS_PATH)],
+            check=True,
+        )
+        print(f"Granted {sudo_user} passwordless sudo for sing-box systemctl commands ({SUDOERS_PATH}).")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def cmd_install(args):
     import tarfile as _tarfile
     import tempfile
@@ -1826,6 +1878,9 @@ def cmd_install(args):
 
     _write_service_unit()
     print("sing-box service installed and enabled.")
+
+    _ensure_passwordless_sudo(skip=getattr(args, "no_sudoers", False))
+
     print("Run: proxyctl add <file.txt> to load proxies.")
 
 
@@ -2631,13 +2686,23 @@ def main():
     )
     p.add_argument("action", choices=["on", "off", "status"])
 
-    sub.add_parser(
+    p = sub.add_parser(
         "install",
         help="download sing-box binary and install systemd service",
         description=(
             "Download the latest sing-box release from GitHub, install it to\n"
-            "/usr/local/bin/sing-box, and create + enable a systemd service unit."
+            "/usr/local/bin/sing-box, create + enable a systemd service unit,\n"
+            "fix ownership of ~/.config/proxyctl and /etc/sing-box so the\n"
+            "invoking user (via $SUDO_USER) can use proxyctl without sudo\n"
+            "afterward, and grant that user passwordless sudo for exactly the\n"
+            "systemctl commands proxyctl needs (see --no-sudoers to skip).\n"
+            "Safe to re-run — every step self-heals rather than only running once."
         ),
+    )
+    p.add_argument(
+        "--no-sudoers", dest="no_sudoers", action="store_true",
+        help="don't write /etc/sudoers.d/proxyctl — you'll be prompted for a "
+             "sudo password on 'proxyctl use'/'watchdog install' etc.",
     )
     sub.add_parser(
         "service-update",
