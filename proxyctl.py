@@ -1349,8 +1349,14 @@ def _watchdog_acquire_lock():
     # Open without truncating (O_CREAT|O_RDWR, no O_TRUNC) — a losing contender must
     # not wipe the winner's PID, or "which pid holds the lock" becomes unanswerable
     # right when it's needed for diagnostics.
-    fd = os.open(WATCHDOG_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
-    fh = os.fdopen(fd, "r+")
+    try:
+        fd = os.open(WATCHDOG_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+        fh = os.fdopen(fd, "r+")
+    except OSError:
+        # E.g. the systemd-run watchdog (root) created this file first and a
+        # regular user can't even open it — functionally the same as losing
+        # the flock race below: someone else already owns the watchdog slot.
+        return None
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

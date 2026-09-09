@@ -320,6 +320,21 @@ def test_watchdog_check_stops_when_no_candidates(tmp_library, monkeypatch):
 
 # ── lock file ────────────────────────────────────────────────────────────────
 
+def test_lock_returns_none_when_file_unopenable(tmp_path, monkeypatch):
+    """Confirmed live: when the systemd-run watchdog (root) creates the lock file
+    first, a regular user pressing 'W' in the TUI later can't even open() it
+    (PermissionError) — must degrade to the same 'already locked' None return as
+    losing the flock race, not crash the TUI.
+    """
+    lock_path = tmp_path / "watchdog.lock"
+    monkeypatch.setattr(proxyctl, "WATCHDOG_LOCK_FILE", lock_path)
+
+    with patch("os.open", side_effect=PermissionError("Permission denied")):
+        result = proxyctl._watchdog_acquire_lock()
+
+    assert result is None
+
+
 def test_lock_prevents_double_acquire(tmp_path, monkeypatch):
     monkeypatch.setattr(proxyctl, "WATCHDOG_LOCK_FILE", tmp_path / "watchdog.lock")
 
