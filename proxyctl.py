@@ -1747,6 +1747,25 @@ def cmd_service_update(args):
     print("sing-box service updated. Changes take effect on next boot (or 'proxyctl restart').")
 
 
+def _fix_config_dir_ownership():
+    """'sudo proxyctl install' resolves CONFIG_DIR to the invoking user's home via
+    SUDO_USER (correct path), but creates it while running as root — leaving the
+    directory root-owned and locking the user out of their own config without
+    sudo on every later command. Chown it back to the invoking user when we can
+    tell who that is (SUDO_UID/SUDO_GID, set by sudo alongside SUDO_USER).
+    """
+    if os.geteuid() != 0:
+        return
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_gid = os.environ.get("SUDO_GID")
+    if sudo_uid is None or sudo_gid is None:
+        return
+    try:
+        os.chown(CONFIG_DIR, int(sudo_uid), int(sudo_gid))
+    except OSError:
+        pass
+
+
 def cmd_install(args):
     import tarfile as _tarfile
     import tempfile
@@ -1793,6 +1812,7 @@ def cmd_install(args):
 
     SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _fix_config_dir_ownership()
 
     _write_service_unit()
     print("sing-box service installed and enabled.")

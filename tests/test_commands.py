@@ -541,6 +541,45 @@ def test_cmd_install_extracts_binary(tmp_path, monkeypatch):
     assert install_calls, "expected an 'install' subprocess call to place the sing-box binary"
 
 
+def test_cmd_install_fixes_config_dir_ownership_under_sudo(tmp_path, monkeypatch):
+    """Confirmed live: 'sudo proxyctl install' resolves CONFIG_DIR to the invoking
+    user's home via SUDO_USER (correct path), but the mkdir runs as root — the
+    directory ends up owned by root, locking the user out of their own config
+    without sudo on every later command.
+    """
+    monkeypatch.setattr(proxyctl, "SING_BOX_BIN", str(tmp_path / "sing-box"))
+    monkeypatch.setattr(proxyctl, "CONFIG_DIR", tmp_path / "cfg")
+    monkeypatch.setattr(proxyctl, "SING_BOX_CONFIG", tmp_path / "etc-sing-box" / "active.json")
+    monkeypatch.setattr(proxyctl, "SING_BOX_SERVICE_PATH", tmp_path / "sing-box.service")
+    monkeypatch.setattr(proxyctl.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_UID", "1234")
+    monkeypatch.setenv("SUDO_GID", "1234")
+    tar_path = _fake_release_tarball(tmp_path)
+    p_urlopen, p_urlretrieve = _patch_install_network(tar_path)
+
+    with p_urlopen, p_urlretrieve, patch("subprocess.run"), \
+         patch("os.chown") as mock_chown:
+        proxyctl.cmd_install(_make_args())
+
+    mock_chown.assert_any_call(proxyctl.CONFIG_DIR, 1234, 1234)
+
+
+def test_cmd_install_skips_chown_when_not_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxyctl, "SING_BOX_BIN", str(tmp_path / "sing-box"))
+    monkeypatch.setattr(proxyctl, "CONFIG_DIR", tmp_path / "cfg")
+    monkeypatch.setattr(proxyctl, "SING_BOX_CONFIG", tmp_path / "etc-sing-box" / "active.json")
+    monkeypatch.setattr(proxyctl, "SING_BOX_SERVICE_PATH", tmp_path / "sing-box.service")
+    monkeypatch.setattr(proxyctl.os, "geteuid", lambda: 1000)
+    tar_path = _fake_release_tarball(tmp_path)
+    p_urlopen, p_urlretrieve = _patch_install_network(tar_path)
+
+    with p_urlopen, p_urlretrieve, patch("subprocess.run"), \
+         patch("os.chown") as mock_chown:
+        proxyctl.cmd_install(_make_args())
+
+    mock_chown.assert_not_called()
+
+
 def test_cmd_install_works_on_python_without_extract_filter_kwarg(tmp_path, monkeypatch):
     """Python < 3.12 doesn't support TarFile.extract(filter=...) (added in 3.12,
     PEP 706) — confirmed live deploying to a Debian 12 / Python 3.11.2 server,
